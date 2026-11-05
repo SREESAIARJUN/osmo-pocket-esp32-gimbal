@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "author": "Sreesai Arjun",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-s3-devkitc-1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-mpu6050",
+      "id": "imu1",
+      "top": 120,
+      "left": -100,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-ssd1306",
+      "id": "oled",
+      "top": 120,
+      "left": 150,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-analog-joystick",
+      "id": "joy",
+      "top": -120,
+      "left": 50,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [
+      "esp:GND.1",
+      "imu1:GND",
+      "black",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "esp:3V3.1",
+      "imu1:VCC",
+      "red",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "esp:21",
+      "imu1:SDA",
+      "green",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "esp:22",
+      "imu1:SCL",
+      "blue",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "esp:GND.2",
+      "oled:GND",
+      "black",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "esp:3V3.2",
+      "oled:VCC",
+      "red",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "esp:21",
+      "oled:SDA",
+      "green",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "esp:22",
+      "oled:SCL",
+      "blue",
+      [
+        "v0"
+      ]
+    ]
+  ]
+}

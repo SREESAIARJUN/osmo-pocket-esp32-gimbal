@@ -1,0 +1,14 @@
+(kicad_sch
+  (version 20231120)
+  (generator "master_parallel_orchestrator")
+  (generator_version "8.0")
+  (uuid "gimbal-esp32-sch-001")
+  (paper "A4")
+  (title_block
+    (title "3-Axis Ultra-Smooth Gimbal Controller (DJI Osmo Pocket Form Factor)")
+    (company "Sreesai Arjun Engineering")
+    (comment 1 "ESP32-S3 Dual LX7 + 3x TMC6300 FOC Drivers + Dual ICM-42688-P IMUs")
+    (comment 2 "AS5600 14-Bit Magnetic Encoders + 2S Li-ion USB-C PD Charging")
+    (rev "1.0")
+  )
+)
