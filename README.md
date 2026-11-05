@@ -1,6 +1,6 @@
 # 3-Axis Ultra-Smooth Gimbal (DJI Osmo Pocket Form Factor)
 
-**Autonomous Engineering Release - Cycle 28**  
+**Autonomous Engineering Release - Cycle 29**  
 *Powered by ESP32-S3 Dual-Core LX7 @ 240MHz, SimpleFOC Field-Oriented Control, and Real Physics Simulation.*
 
 ---
