@@ -1,11 +1,11 @@
 %TF.GenerationSoftware,KiCad,Pcbnew,8.0.9-8.0.9-0~ubuntu24.04.1*%
-%TF.CreationDate,2026-11-05T21:11:26+00:00*%
+%TF.CreationDate,2026-11-05T21:13:27+00:00*%
 %TF.ProjectId,osmo-pocket-esp32-gimbal,6f736d6f-2d70-46f6-936b-65742d657370,1.0*%
 %TF.SameCoordinates,Original*%
 %TF.FileFunction,Profile,NP*%
 %FSLAX46Y46*%
 G04 Gerber Fmt 4.6, Leading zero omitted, Abs format (unit mm)*
-G04 Created by KiCad (PCBNEW 8.0.9-8.0.9-0~ubuntu24.04.1) date 2026-11-05 21:11:26*
+G04 Created by KiCad (PCBNEW 8.0.9-8.0.9-0~ubuntu24.04.1) date 2026-11-05 21:13:27*
 %MOMM*%
 %LPD*%
 G01*
