@@ -2,7 +2,7 @@
   "status": "PASS",
   "duration_sec": 2.0,
   "rms_disturbance_deg": 6.404261224798628,
-  "rms_stabilized_deg": 0.3967514772619234,
-  "vibration_attenuation_db": -24.159009713221288,
+  "rms_stabilized_deg": 0.3983543806222369,
+  "vibration_attenuation_db": -24.12398881528379,
   "stability_metric": "SUB-0.05_DEGREE_HORIZON_LOCK"
 }
