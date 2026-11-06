@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Rev 7.0 schematic for the osmo-pocket-esp32-gimbal controller.
+"""Generate the Rev 56.0 schematic for the osmo-pocket-esp32-gimbal controller.
 
 Emits kicad/osmo-pocket-esp32-gimbal.kicad_sch (KiCad 8 format) deterministically:
 every UUID is uuid5() of a stable key, so re-running produces a byte-identical file.
@@ -13,6 +13,9 @@ Contents:
   * U3..U5 AS5600-ASOM magnetic encoders (0x36) behind mux channels 0/1/2 (PAN/ROLL/PITCH)
   * J1..J3 4-pin connectors to the remote encoder flex boards
   * pull-ups, decoupling, power symbols, PWR_FLAGs, no-connect flags, address-plan note
+  * Rev 56: U6 TPS563201 VBAT->+5V buck (J4, C11-C15, L1, R11-R14, TP1/TP3) and the
+    handle-IMU analog island: U7 ICM-42688-P on +3V3_IMU (FB1 ferrite) / GNDA, joined to
+    GND only through net tie NT1; R15 MISO series termination, C16-C18, TP2/TP4-TP7
 
 Usage:
   python3 kicad/tools/gen_rev7_schematic.py                       # write the schematic
@@ -172,6 +175,74 @@ def conn4():
     return s
 
 
+def inductor():
+    arcs = []
+    for k in range(4):
+        y1 = 2.54 - k * 1.27
+        arcs.append(f"(arc (start 0 {f(y1)}) (mid 0.635 {f(y1 - 0.635)}) (end 0 {f(y1 - 1.27)}) "
+                    f"(stroke (width 0) (type default)) (fill (type none)))")
+    sx = f"""(symbol "{LIB}:L" (pin_numbers hide) (pin_names (offset 1.016) hide) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    {_props("L", "L", (2.032, 0), (0, 0), "", "~", "Inductor / ferrite bead")}
+    (symbol "L_0_1"
+      {chr(10).join('      ' + a for a in arcs).lstrip()}
+    )
+    (symbol "L_1_1"
+      {_pin("passive", 0, 3.81, 270, 1.27, "1", "1")}
+      {_pin("passive", 0, -3.81, 90, 1.27, "2", "2")}
+    )
+  )"""
+    return LibSym("L", sx, {"1": (0, 3.81, 270, "1"), "2": (0, -3.81, 90, "2")})
+
+
+def net_tie():
+    """2-pin net tie; KiCad 8 treats it as a tie through the footprint's net_tie_pad_groups."""
+    sx = f"""(symbol "{LIB}:NetTie_2" (pin_numbers hide) (pin_names (offset 0) hide) (exclude_from_sim no) (in_bom no) (on_board yes)
+    {_props("NT", "NetTie_2", (2.032, 0), (0, 0), "NetTie:NetTie-2_SMD_Pad0.5mm", "~", "Net tie, 2 pins (single-point GND/GNDA star)")}
+    (property "ki_keywords" "net tie short" (at 0 0 0) {FONT_HIDE})
+    (symbol "NetTie_2_0_1"
+      (polyline (pts (xy 0 1.27) (xy 0 -1.27)) (stroke (width 0.762) (type default)) (fill (type none)))
+    )
+    (symbol "NetTie_2_1_1"
+      {_pin("passive", 0, 2.54, 270, 1.27, "1", "1")}
+      {_pin("passive", 0, -2.54, 90, 1.27, "2", "2")}
+    )
+  )"""
+    s = LibSym("NetTie_2", sx, {"1": (0, 2.54, 270, "1"), "2": (0, -2.54, 90, "2")})
+    s.in_bom = False
+    return s
+
+
+def test_point():
+    """1-pin test point, pin to the left (glabel/power attaches on the left)."""
+    sx = f"""(symbol "{LIB}:TestPoint" (pin_numbers hide) (pin_names (offset 0.762) hide) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    {_props("TP", "TestPoint", (2.54, 1.27), (2.54, -1.27), "TestPoint:TestPoint_Pad_D1.0mm", "~", "Test point (1.0 mm SMD pad)")}
+    (symbol "TestPoint_0_1"
+      (circle (center 0.762 0) (radius 0.762) (stroke (width 0) (type default)) (fill (type none)))
+    )
+    (symbol "TestPoint_1_1"
+      {_pin("passive", -2.54, 0, 0, 2.54, "1", "1")}
+    )
+  )"""
+    return LibSym("TestPoint", sx, {"1": (-2.54, 0, 0, "1")})
+
+
+def conn2_batt():
+    pins = {"1": (-5.08, 0, 0, "VBAT+"), "2": (-5.08, -P, 0, "VBAT-")}
+    psx = [_pin("passive", -5.08, y, 0, 3.81, nm, n) for n, (_, y, _, nm) in pins.items()]
+    sx = f"""(symbol "{LIB}:Conn_01x02_Battery" (pin_names (offset 1.016)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    {_props("J", "Conn_01x02_Battery", (0, 6.35), (0, 3.81), "", "~", "2-pin battery connector (1 = VBAT+, 2 = GND); MP pads mechanical only")}
+    (symbol "Conn_01x02_Battery_0_1"
+      (rectangle (start -1.27 1.27) (end 7.62 -3.81) (stroke (width 0.254) (type default)) (fill (type background)))
+    )
+    (symbol "Conn_01x02_Battery_1_1"
+      {chr(10).join('      ' + p for p in psx).lstrip()}
+    )
+  )"""
+    s = LibSym("Conn_01x02_Battery", sx, pins)
+    s.top, s.bot = 1.27, -3.81
+    return s
+
+
 def power_sym(name, graphics, val_y, desc):
     sx = f"""(symbol "{LIB}:{name}" (power) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
     {_props("#PWR", name, (0, -val_y * 1.6), (0, val_y), "", "", desc, ref_hide=True)}
@@ -253,6 +324,40 @@ SYMS = {
     "FLG": pwr_flag(),
 }
 
+# ---------------------------------------------------------------- Rev 56 symbols
+ARROW_UP = ("(polyline (pts (xy -0.762 1.27) (xy 0 2.54)) (stroke (width 0) (type default)) (fill (type none)))\n"
+                      "      (polyline (pts (xy 0 0) (xy 0 2.54)) (stroke (width 0) (type default)) (fill (type none)))\n"
+                      "      (polyline (pts (xy 0 2.54) (xy 0.762 1.27)) (stroke (width 0) (type default)) (fill (type none)))")
+GND_TRI = ("(polyline (pts (xy 0 0) (xy 0 -1.27) (xy 1.27 -1.27) (xy 0 -2.54) (xy -1.27 -1.27) (xy 0 -1.27)) "
+           "(stroke (width 0) (type default)) (fill (type none)))")
+TPS_LEFT = [("3", "VIN", PIN), ("5", "EN", INP), ("1", "GND", PIN)]
+TPS_RIGHT = [("6", "VBST", INP), ("2", "SW", "power_out"), ("4", "VFB", INP)]
+NCP = PAS  # RESV: passive pin + explicit no-connect flag (no_connect type + flag trips ERC warnings)
+ICM_LEFT = [("8", "VDD", PIN), ("5", "VDDIO", PIN), ("6", "GND", PIN), ("7", "RESV", PAS),
+            ("2", "RESV", NCP), ("3", "RESV", NCP), ("10", "RESV", NCP), ("11", "RESV", NCP)]
+ICM_RIGHT = [("12", "AP_CS", INP), ("13", "AP_SCLK", INP), ("14", "AP_SDI", INP), ("1", "AP_SDO", OUT),
+             ("4", "INT1", OUT), ("9", "INT2/FSYNC", INP)]
+SYMS.update({
+    "TPS": ic_symbol("TPS563201DDCR", "U", "TPS563201DDCR", TPS_LEFT, TPS_RIGHT, hw=7.62,
+                     footprint="Package_TO_SOT_SMD:SOT-23-6",
+                     datasheet="https://www.ti.com/lit/ds/symlink/tps563201.pdf",
+                     desc="4.5-17V 3A synchronous buck, D-CAP2, 580 kHz, SOT-23-6"),
+    "ICM": ic_symbol("ICM-42688-P", "U", "ICM-42688-P", ICM_LEFT, ICM_RIGHT, hw=10.16,
+                     footprint="Package_LGA:LGA-14_3x2.5mm_P0.5mm_LayoutBorder3x4y",
+                     datasheet="https://invensense.tdk.com/wp-content/uploads/2020/04/ds-000347_icm-42688-p-datasheet.pdf",
+                     desc="6-axis MEMS IMU (gyro + accel), SPI/I2C, LGA-14 3x2.5 mm"),
+    "L": inductor(),
+    "NT": net_tie(),
+    "TP": test_point(),
+    "J2": conn2_batt(),
+    "VBAT": power_sym("VBAT", ARROW_UP, 3.556, "Power symbol creates a global label with name \"VBAT\""),
+    "+5V": power_sym("+5V", ARROW_UP, 3.556, "Power symbol creates a global label with name \"+5V\""),
+    "+3V3_IMU": power_sym("+3V3_IMU", ARROW_UP, 3.556,
+                          "Power symbol creates a global label with name \"+3V3_IMU\" (ferrite-isolated IMU rail)"),
+    "GNDA": power_sym("GNDA", GND_TRI, -3.81,
+                      "Power symbol creates a global label with name \"GNDA\" , analog (IMU island) ground"),
+})
+
 # ---------------------------------------------------------------------------
 # Schematic items
 # ---------------------------------------------------------------------------
@@ -280,7 +385,7 @@ class Inst:
             vfont = FONT_HIDE if (ang or hide_value) else FONT
             props.append(f"(property \"Value\" {q(value)} (at {f(x + vx)} {f(y + vy)} 0) {vfont})")
             fp = ""
-        elif sym.name in ("R", "C"):
+        elif sym.name in ("R", "C", "L", "NetTie_2", "TestPoint"):
             props.append(f"(property \"Reference\" {q(ref)} (at {f(x + 2.54)} {f(y - 1.27)} 0) (effects (font (size 1.27 1.27)) (justify left)))")
             props.append(f"(property \"Value\" {q(value)} (at {f(x + 2.54)} {f(y + 1.27)} 0) (effects (font (size 1.27 1.27)) (justify left)))")
             fp = footprint or ""
@@ -298,7 +403,7 @@ class Inst:
         if mpn:
             props.append(f"(property \"MPN\" {q(mpn)} (at {f(x)} {f(y)} 0) {FONT_HIDE})")
         pins = "\n    ".join(f"(pin {q(n)} (uuid {q(U(f'pin/{ref}/{n}'))}))" for n in sym.pins)
-        bom = "no" if sym.power else "yes"
+        bom = "no" if (sym.power or not getattr(sym, "in_bom", True)) else "yes"
         items.append(f"""(symbol (lib_id {q(sym.lib_id)}) (at {f(x)} {f(y)} {ang}) (unit 1)
     (exclude_from_sim no) (in_bom {bom}) (on_board yes) (dnp no)
     (uuid {q(U(f'sym/{ref}'))})
@@ -327,6 +432,14 @@ def flag(x, y):
     return Inst(SYMS["FLG"], f"#FLG0{flg_count[0]}", "PWR_FLAG", x, y)
 
 
+def flagged(kind, x, y, dx=7.62):
+    """Power symbol + PWR_FLAG pair (power symbol at x, flag dx mm to the right)."""
+    power(kind, x, y)
+    wire((x, y), (x + dx, y))
+    flag(x + dx, y)
+    expected.setdefault(kind, set()).add((f"#FLG0{flg_count[0]}", "1"))
+
+
 def wire(a, b):
     items.append(f"(wire (pts (xy {f(a[0])} {f(a[1])}) (xy {f(b[0])} {f(b[1])})) "
                  f"(stroke (width 0) (type default)) (uuid {q(U(f'wire/{f(a[0])},{f(a[1])}-{f(b[0])},{f(b[1])}'))}))")
@@ -337,10 +450,13 @@ JUST = {0: "left bottom", 90: "left bottom", 180: "right bottom", 270: "right bo
 GJUST = {0: "left", 90: "left", 180: "right", 270: "right"}
 PWR_ROT = {"GND": {(0, 1): 0, (1, 0): 90, (0, -1): 180, (-1, 0): 270},
            "+3V3": {(0, -1): 0, (-1, 0): 90, (0, 1): 180, (1, 0): 270}}
+PWR_ROT["GNDA"] = PWR_ROT["GND"]
+for _k in ("VBAT", "+5V", "+3V3_IMU"):
+    PWR_ROT[_k] = PWR_ROT["+3V3"]
 
 
 def connect(inst, num, kind, name=None, length=5.08, shape="output", hide_value=False):
-    """Attach a pin: kind in {'nc', 'label', 'glabel', '+3V3', 'GND'}."""
+    """Attach a pin: kind in {'nc', 'label', 'glabel'} or a power-symbol name (see PWR_ROT)."""
     (px, py), away = inst.pin_pos(num)
     if kind == "nc":
         items.append(f"(no_connect (at {f(px)} {f(py)}) (uuid {q(U(f'nc/{inst.ref}/{num}'))}))")
@@ -363,9 +479,9 @@ def connect(inst, num, kind, name=None, length=5.08, shape="output", hide_value=
     expected.setdefault(net, set()).add((inst.ref, num))
 
 
-def passive(sym, ref, value, x, y, top, bottom, fp):
-    """Vertical R/C at (x, y). top/bottom = (kind, name)."""
-    i = Inst(SYMS[sym], ref, value, x, y, footprint=fp)
+def passive(sym, ref, value, x, y, top, bottom, fp, mpn=None):
+    """Vertical R/C/L/net-tie at (x, y). top/bottom = (kind, name)."""
+    i = Inst(SYMS[sym], ref, value, x, y, footprint=fp, mpn=mpn)
     connect(i, "1", top[0], top[1], length=2.54)
     connect(i, "2", bottom[0], bottom[1], length=2.54)
     return i
@@ -469,6 +585,101 @@ for ch, ax in enumerate(AXES):
     passive("C", f"C{5 + 2 * ch}", "100nF", 342.9, by + 22.86, V33, GND, C0402)
     passive("C", f"C{6 + 2 * ch}", "1uF", 353.06, by + 22.86, V33, GND, C0402)
 
+# ---------------------------------------------------------------- Rev 56: 5V buck
+C0805 = "Capacitor_SMD:C_0805_2012Metric"
+VBAT = ("VBAT", None)
+V5 = ("+5V", None)
+V33I = ("+3V3_IMU", None)
+GNDA = ("GNDA", None)
+TP_FP = "TestPoint:TestPoint_Pad_D1.0mm"
+
+flagged("VBAT", 165.1, 190.5)
+flagged("+5V", 185.42, 190.5)
+
+J4 = Inst(SYMS["J2"], "J4", "BATT 2S (JST-PH 2p)", 175.26, 208.28,
+          footprint="Connector_JST:JST_PH_S2B-PH-SM4-TB_1x02-1MP_P2.00mm_Horizontal", mpn="S2B-PH-SM4-TB")
+connect(J4, "1", "VBAT")
+connect(J4, "2", "GND")
+
+U6 = Inst(SYMS["TPS"], "U6", "TPS563201DDCR", 215.9, 210.82, mpn="TPS563201DDCR")
+U6_MAP = {"3": VBAT, "5": lbl("EN_5V"), "1": GND, "6": lbl("BST_5V"), "2": lbl("SW_5V"), "4": lbl("FB_5V")}
+for num in U6.sym.pins:
+    connect(U6, num, *U6_MAP[num])
+
+BUCK_X = [165.1, 184.15, 203.2, 222.25, 241.3]
+# input side: hot-loop caps, EN UVLO divider, bootstrap
+passive("C", "C11", "10uF 25V X7R", BUCK_X[0], 231.14, VBAT, GND, C0805)
+passive("C", "C12", "100nF 25V X7R", BUCK_X[1], 231.14, VBAT, GND, C0402)
+passive("R", "R13", "100k 1%", BUCK_X[2], 231.14, VBAT, lbl("EN_5V"), R0402)
+passive("R", "R14", "24.9k 1%", BUCK_X[3], 231.14, lbl("EN_5V"), GND, R0402)
+passive("C", "C13", "100nF 16V", BUCK_X[4], 231.14, lbl("BST_5V"), lbl("SW_5V"), C0402)
+# output side: inductor, COUT, feedback divider (Kelvin-sensed at COUT)
+passive("L", "L1", "3.3uH 5A", BUCK_X[0], 256.54, lbl("SW_5V"), V5, "Inductor_SMD:L_Coilcraft_XGL4030",
+        mpn="XGL4030-332MEC")
+passive("C", "C14", "22uF 10V X5R", BUCK_X[1], 256.54, V5, GND, C0805)
+passive("C", "C15", "22uF 10V X5R", BUCK_X[2], 256.54, V5, GND, C0805)
+passive("R", "R11", "54.9k 1%", BUCK_X[3], 256.54, V5, lbl("FB_5V"), R0402)
+passive("R", "R12", "10k 1%", BUCK_X[4], 256.54, lbl("FB_5V"), GND, R0402)
+
+
+def test_point(ref, value, x, y, kind, name=None):
+    t = Inst(SYMS["TP"], ref, value, x, y, footprint=TP_FP)
+    connect(t, "1", kind, name, length=2.54 if name is None else 5.08,
+            shape=GLABEL_SHAPE.get(name, "output"))
+    return t
+
+
+
+# ---------------------------------------------------------------- Rev 56: handle IMU analog island
+flagged("+3V3_IMU", 365.76, 190.5, dx=12.7)
+flagged("GNDA", 391.16, 190.5)
+
+U7 = Inst(SYMS["ICM"], "U7", "ICM-42688-P", 325.12, 205.74, mpn="ICM-42688-P")
+U7_MAP = {"8": V33I, "5": V33I, "6": GNDA, "7": GNDA,
+          "12": ("glabel", "IMU_CS_HANDLE"), "13": ("glabel", "IMU_SPI_SCK"),
+          "14": ("glabel", "IMU_SPI_MOSI"), "1": lbl("IMU_SDO_RAW")}
+for num in U7.sym.pins:
+    kind, name = U7_MAP.get(num, ("nc", None))      # 2, 3, 4, 9, 10, 11 -> no-connect
+    connect(U7, num, kind, name, length=2.54 if kind in PWR_ROT else 5.08, shape="input")
+
+IMU_X = [297.18, 316.23, 335.28, 354.33, 373.38, 392.43]
+passive("L", "FB1", "600R@100MHz", IMU_X[0], 228.6, V33, V33I, "Inductor_SMD:L_0402_1005Metric",
+        mpn="BLM15AG601SN1D")
+passive("C", "C16", "1uF 10V X5R", IMU_X[1], 228.6, V33I, GNDA, C0402)
+passive("C", "C17", "100nF 10V X7R", IMU_X[2], 228.6, V33I, GNDA, C0402)
+passive("C", "C18", "100nF 10V X7R", IMU_X[3], 228.6, V33I, GNDA, C0402)
+passive("NT", "NT1", "NetTie_2", IMU_X[4], 228.6, GND, GNDA, "NetTie:NetTie-2_SMD_Pad0.5mm")
+R15 = Inst(SYMS["R"], "R15", "33R", IMU_X[5], 223.52, footprint=R0402)
+connect(R15, "1", "label", "IMU_SDO_RAW", length=2.54)
+connect(R15, "2", "glabel", "IMU_SPI_MISO", length=2.54, shape=GLABEL_SHAPE["IMU_SPI_MISO"])
+
+# test points (TP2, TP4-TP7 sit on the digital side of the island moat)
+TP_ROWS = [("TP1", "+5V"), ("TP3", "GND"), ("TP2", "+3V3"), ("TP4", "IMU_SPI_SCK"),
+           ("TP5", "IMU_SPI_MOSI"), ("TP6", "IMU_SPI_MISO"), ("TP7", "IMU_CS_HANDLE")]
+for k, (ref, net) in enumerate(TP_ROWS):
+    if net in PWR_ROT:
+        test_point(ref, net, 281.94, 228.6 + k * 7.62, net)
+    else:
+        test_point(ref, net, 281.94, 228.6 + k * 7.62, "glabel", net)
+
+NOTE56 = """REV 56.0 - 5V BUCK (U6) + HANDLE IMU ANALOG ISLAND (U7)
+5V BUCK  VBAT = 2S Li-ion 6.0-8.4 V (J4) -> U6 TPS563201DDCR (D-CAP2, fsw = 580 kHz) -> +5V
+  VOUT = 0.768 V x (1 + R11/R12) = 0.768 x (1 + 54.9k/10k) = 4.984 V
+  EN UVLO: VON = 1.2 V x (1 + R13/R14) = 1.2 x (1 + 100k/24.9k) = 6.02 V (2S cut-off)
+  L1 3.3uH: dIL = (VIN-VOUT) x VOUT / (VIN x L x fsw) = 0.44 A p-p @ 6.0 V ... 1.06 A p-p @ 8.4 V
+  Hot loop: C12 100nF 0402 (nearest, pad edge <= 1.0 mm) + C11 10uF -> U6 VIN(3) / GND(1),
+    GND vias at C11/C12/U6.1 straight into In1.Cu GND (0.21 mm prepreg). No vias on SW_5V.
+  C13 bootstrap VBST-SW; COUT = C14 + C15 2x 22uF; FB_5V Kelvin-sensed at COUT, away from SW/L1.
+HANDLE IMU ANALOG ISLAND (GNDA)
+  +3V3 -> FB1 600R@100MHz ferrite -> +3V3_IMU; C16 1uF + C17 (VDD) / C18 (VDDIO) 100nF to GNDA.
+  GNDA is its own net and pour; the ONLY GND-GNDA connection is NT1 (single-point star net tie).
+  IMU_SPI_SCK / MOSI / MISO / CS_HANDLE cross the moat beside NT1 (return-current bridge).
+  R15 33R source-terminates MISO at U7 (IMU_SDO_RAW -> IMU_SPI_MISO).
+  U7 pin 7 RESV -> GNDA; pins 2, 3, 4 (INT1), 9 (INT2), 10, 11 not connected.
+  Test points: TP1 +5V, TP2 +3V3, TP3 GND, TP4-TP7 IMU SPI + CS (digital side of the moat)."""
+items.append(f"(text {q(NOTE56)} (exclude_from_sim no) (at 20.32 241.3 0) "
+             f"(effects (font (size 1.524 1.524)) (justify left top)) (uuid {q(U('text/rev56-buck-imu'))}))")
+
 # ---------------------------------------------------------------- notes
 NOTE = """REV 7.0 - ENCODER I2C ADDRESS PLAN
 I2C0 (ENC_SDA = GPIO17, ENC_SCL = GPIO18), 2.2k pull-ups to +3V3 on the upstream bus
@@ -481,7 +692,7 @@ AS5600 address 0x36 is fixed, so the three encoders can only share I2C0 behind t
 U3..U5 sit on the remote encoder flex boards; drawn here with their 3.3V-mode wiring
 (VDD5V tied to VDD3V3, DIR = GND, PGO = GND, OUT unused).
 GPIO22-25 do not exist on ESP32-S3; Rev6 SCL=GPIO22 bug fixed (SCL now GPIO18).
-Motor / IMU / VBAT nets are global labels only (drivers + IMUs on other sheets / future revs).
+Motor / camera-IMU / VBAT_SENSE nets are global labels only (handle IMU U7: Rev 56 section).
 GPIO map source of truth: firmware/src/gimbal_pins.h"""
 items.append(f"(text {q(NOTE)} (exclude_from_sim no) (at 20.32 200.66 0) "
              f"(effects (font (size 1.524 1.524)) (justify left top)) (uuid {q(U('text/address-plan'))}))")
@@ -498,10 +709,11 @@ def render():
   (paper "A3")
   (title_block
     (title "3-Axis Ultra-Smooth Gimbal Controller (DJI Osmo Pocket Form Factor)")
-    (rev "7.0")
+    (rev "56.0")
     (company "Sreesai Arjun Engineering")
     (comment 1 "ESP32-S3 Dual LX7 + 3x TMC6300 FOC Drivers + Dual ICM-42688-P IMUs")
-    (comment 2 "Production Revision 7.0 / 150 - TCA9548A AS5600 address-conflict resolution + validated ESP32-S3 GPIO map")
+    (comment 2 "Production Revision 56.0 / 150 - 5V buck hot loop + handle-IMU GNDA island")
+    (comment 3 "Rev 7.0 - TCA9548A AS5600 address fix + validated ESP32-S3 GPIO map")
   )
   (lib_symbols
   {libs}
