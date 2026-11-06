@@ -65,7 +65,17 @@ struct EncoderSample {
 class EncoderBus {
 public:
     static constexpr uint8_t  NUM_AXES              = 3;
-    static constexpr uint8_t  MAX_CONSECUTIVE_FAILS = 8;    // ~3 ms of lost samples
+    static constexpr uint8_t  MAX_CONSECUTIVE_FAILS = 8;    // fast-NACK faults: ~3 ms of lost samples
+    // Time-based triggers. A bus that *times out* (SCL/SDA held low) costs a full
+    // 2 ms Wire timeout per transaction, so a failure count alone would reach
+    // recovery only after ~16-48 ms — long after the FOC stale watchdog
+    // (ENC_STALE_LIMIT_US = 10 ms) has latched the axis off. Recovery therefore
+    // also fires once an axis has gone RECOVERY_AFTER_US without a good sample,
+    // and a fault is latched FAULT_AFTER_US after that if recovery did not help.
+    // Invariant (host-tested): worst-case sample age through a recoverable hang
+    // stays below ENC_STALE_LIMIT_US.
+    static constexpr uint32_t RECOVERY_AFTER_US     = 1500;
+    static constexpr uint32_t FAULT_AFTER_US        = 6000;
     static constexpr uint16_t FAST_READ_TOLERANCE   = 8;    // counts (0.7 deg) for self-test
 
     /**
@@ -121,6 +131,8 @@ private:
     bool      fast_read_[NUM_AXES] = {false, false, false};
     uint8_t   agc_[NUM_AXES] = {0, 0, 0};
     uint8_t   fails_[NUM_AXES] = {0, 0, 0};
+    uint32_t  last_good_us_[NUM_AXES] = {0, 0, 0};
+    bool      recovered_[NUM_AXES] = {false, false, false};  // recovery already tried since last good sample
     uint32_t  recoveries_ = 0;
     uint32_t  last_sweep_us_ = 0;
     std::atomic<uint32_t> sweeps_{0};

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Rev 7.0 host-side verification of the encoder mux stack and ESP32-S3 pin map.
+# Rev 7.0/8.0 host-side verification of the encoder mux stack, ESP32-S3 pin map
+# and (Rev 8.0) the anti-cogging LUT / electrical-angle / feed-forward math.
 #  1. Builds the real firmware sources (tca9548a.cpp, as5600_mux.cpp) against
 #     Arduino/Wire/SimpleFOC mocks with -Wall -Wextra -Werror and runs the tests.
 #  2. Negative compile test: proves gimbal_pins.h rejects the Rev 6.0 GPIO22 SCL
@@ -16,6 +17,14 @@ echo "== build & run unit tests"
 "$CXX" "${FLAGS[@]}" -fsanitize=address,undefined \
     "$HERE/test_encoder_mux.cpp" "$SRC/tca9548a.cpp" "$SRC/as5600_mux.cpp" -o "$OUT/t"
 "$OUT/t"
+
+echo "== build & run anti-cogging tests (Rev 8.0)"
+# The module itself must be free of implicit float->double promotion: the
+# ESP32-S3 FPU is single-precision only, doubles in the FOC path are soft-float.
+"$CXX" "${FLAGS[@]}" -Wconversion -Wdouble-promotion -fsanitize=address,undefined \
+    -c "$SRC/anti_cogging.cpp" -o "$OUT/anti_cogging.o"
+"$CXX" "${FLAGS[@]}" -fsanitize=address,undefined "$HERE/test_anti_cogging.cpp" "$OUT/anti_cogging.o" -o "$OUT/ac"
+"$OUT/ac"
 
 echo "== negative pin-map compile tests"
 neg() {  # $1 description, $2 sed expression applied to a copy of gimbal_pins.h

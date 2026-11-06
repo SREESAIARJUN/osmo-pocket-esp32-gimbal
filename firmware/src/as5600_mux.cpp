@@ -141,6 +141,7 @@ void EncoderBus::publish(uint8_t axis, uint16_t raw) {
     s.t_us.store(static_cast<uint32_t>(micros()), std::memory_order_relaxed);
     s.count.store(s.count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     s.seq.store(q + 2, std::memory_order_release);         // even: stable
+    last_good_us_[axis] = s.t_us.load(std::memory_order_relaxed);
 }
 
 bool EncoderBus::latest(uint8_t axis, EncoderSample& out) const {
@@ -177,7 +178,6 @@ void EncoderBus::recover() {
 uint8_t EncoderBus::pollOnce() {
     const uint32_t t0 = static_cast<uint32_t>(micros());
     uint8_t ok = 0;
-    bool need_recovery = false;
 
     for (uint8_t a = 0; a < NUM_AXES; ++a) {
         if (health_[a] != EncoderHealth::OK) continue;
@@ -185,17 +185,25 @@ uint8_t EncoderBus::pollOnce() {
         if (readAxis(a, raw)) {
             publish(a, raw);
             fails_[a] = 0;
+            recovered_[a] = false;
             ++ok;
             continue;
         }
         mux_.invalidate();  // channel state unknown after an error
-        if (++fails_[a] == MAX_CONSECUTIVE_FAILS) {
-            need_recovery = true;
-        } else if (fails_[a] >= 2 * MAX_CONSECUTIVE_FAILS) {
+        if (fails_[a] < 255) ++fails_[a];
+        const uint32_t starved = static_cast<uint32_t>(micros()) - last_good_us_[a];
+
+        if (!recovered_[a]) {
+            if (fails_[a] >= MAX_CONSECUTIVE_FAILS || starved >= RECOVERY_AFTER_US) {
+                // Recover immediately (not at end of sweep) so the remaining axes
+                // are read on a cleared bus within this same sweep.
+                recovered_[a] = true;
+                recover();
+            }
+        } else if (fails_[a] >= 2 * MAX_CONSECUTIVE_FAILS || starved >= FAULT_AFTER_US) {
             health_[a] = EncoderHealth::BUS_FAULT;  // recovery did not help: latch fault
         }
     }
-    if (need_recovery) recover();
 
     last_sweep_us_ = static_cast<uint32_t>(micros()) - t0;
     sweeps_.fetch_add(1, std::memory_order_relaxed);
