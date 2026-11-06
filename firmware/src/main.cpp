@@ -1,5 +1,5 @@
 /**
- * ESP32-S3 3-Axis Ultra-Smooth Gimbal Controller — Revision 8.0
+ * ESP32-S3 3-Axis Ultra-Smooth Gimbal Controller — Revision 57.0
  * Framework: Arduino-ESP32 / SimpleFOC
  * Hardware: 3x TMC6300 BLDC drivers, 3x AS5600 12-bit encoders behind a
  *           TCA9548A I2C switch, dual ICM-42688-P IMUs (SPI)
@@ -12,6 +12,15 @@
  *   512-point cogging-torque LUT per axis indexed by the NORMALISED electrical
  *   angle wrap(dir*pp*theta_m - zero_electric_angle); feed-forward
  *   Vq = -tau_cog(theta_e + omega_e*latency) * R/Kt, faded out at speed.
+ *
+ * Rev 57.0 attitude:
+ *   core 0: imu_spi task (prio 6, 1 kHz vTaskDelayUntil) drains both ICM-42688-P
+ *           FIFOs (20-bit records + device timestamps), subtracts the
+ *           temperature-modelled gyro bias, runs a Madgwick AHRS per IMU and
+ *           publishes AttitudeState through a seqlock.
+ *   NVS:    the learned gyro bias(T) model is restored at boot and saved on
+ *           the 'B' serial command while all motors are idle (flash writes
+ *           stall both cores' caches, so never while commutating).
  */
 
 #include <Arduino.h>
@@ -23,6 +32,42 @@
 #include "tca9548a.h"
 #include "as5600_mux.h"
 #include "anti_cogging.h"
+#include "icm42688.h"
+#include "imu_pipeline.h"
+#include <Preferences.h>
+
+// ---------------------------------------------------------------------------
+// IMUs: 2x ICM-42688-P on SPI2 (FSPI), one owner task on core 0
+// ---------------------------------------------------------------------------
+static SPIClass         imuSpi(FSPI);
+static ArduinoSpiDevice imuDevCam(imuSpi, pins::IMU_CS_CAMERA, IMU_SPI_HZ);
+static ArduinoSpiDevice imuDevHandle(imuSpi, pins::IMU_CS_HANDLE, IMU_SPI_HZ);
+static ICM42688         imuCam(imuDevCam);
+static ICM42688         imuHandle(imuDevHandle);
+
+static constexpr ImuMount kCamMount{IMU_CAM_MOUNT};
+static constexpr ImuMount kHandleMount{IMU_HANDLE_MOUNT};
+static_assert(kCamMount.valid(),    "IMU_CAM_MOUNT must be a proper signed axis permutation");
+static_assert(kHandleMount.valid(), "IMU_HANDLE_MOUNT must be a proper signed axis permutation");
+
+static ImuChannel::Config imu_config() {
+    ImuChannel::Config c;
+    c.ahrs.beta        = AHRS_BETA;
+    c.ahrs.beta_init   = AHRS_BETA_INIT;
+    c.ahrs.init_time_s = AHRS_INIT_TIME_S;
+    c.ahrs.zeta        = AHRS_ZETA;
+    c.ahrs.gate_lo_g   = AHRS_GATE_LO_G;
+    c.ahrs.gate_hi_g   = AHRS_GATE_HI_G;
+    c.bias.b0_sigma0   = GYRO_BIAS_B0_SIGMA_DPS * icm42688::DEG2RAD;
+    c.bias.b1_sigma0   = GYRO_BIAS_B1_SIGMA_DPS_C * icm42688::DEG2RAD;
+    return c;
+}
+static ImuChannel imuChanCam(imuCam, kCamMount, imu_config());
+static ImuChannel imuChanHandle(imuHandle, kHandleMount, imu_config());
+static ImuChannel* const kImuChannels[] = {&imuChanCam, &imuChanHandle};
+static const char* const kImuNames[]    = {"CAMERA", "HANDLE"};
+static const char* const kImuNvsKeys[]  = {"gtm_cam", "gtm_hdl"};
+static constexpr uint8_t kNumImus = sizeof(kImuChannels) / sizeof(kImuChannels[0]);
 
 // ---------------------------------------------------------------------------
 // Encoder bus: one TCA9548A, three AS5600 (all at 0x36) on separate channels
@@ -156,10 +201,77 @@ static bool init_axis(Axis& ax, uint8_t idx) {
     return true;
 }
 
+static void imu_bias_load() {
+    Preferences nvs;
+    if (!nvs.begin("imu_bias", true)) return;
+    for (uint8_t i = 0; i < kNumImus; ++i) {
+        GyroTempModel m;
+        const bool ok = nvs.getBytes(kImuNvsKeys[i], &m, sizeof m) == sizeof m &&
+                        kImuChannels[i]->importBiasModel(m, 3600.0f);  // assume >= 1 h since saved
+        Serial.printf("[IMU] %-6s bias(T) model %s\n", kImuNames[i], ok ? "restored from NVS" : "not stored -> factory prior");
+    }
+    nvs.end();
+}
+
+static void imu_bias_save() {
+    for (uint8_t i = 0; i < EncoderBus::NUM_AXES; ++i) {
+        if (axes[i].active) {
+            Serial.println(F("[IMU] bias save refused: motors active (flash write stalls both cores)"));
+            return;
+        }
+    }
+    Preferences nvs;
+    if (!nvs.begin("imu_bias", false)) return;
+    for (uint8_t i = 0; i < kNumImus; ++i) {
+        GyroTempModel m;
+        if (!kImuChannels[i]->latestModel(m) || !m.valid()) continue;
+        nvs.putBytes(kImuNvsKeys[i], &m, sizeof m);
+        Serial.printf("[IMU] %-6s bias(T) model saved (%lu windows, %.1f degC span)\n", kImuNames[i],
+                      (unsigned long)m.updates, m.t_max - m.t_min);
+    }
+    nvs.end();
+}
+
+static void imu_setup() {
+    // Both chip selects high before the bus clocks, so neither IMU sees a
+    // spurious transaction while the other is configured.
+    imuDevCam.begin();
+    imuDevHandle.begin();
+    imuSpi.begin(pins::IMU_SPI_SCK, pins::IMU_SPI_MISO, pins::IMU_SPI_MOSI, -1);
+    imu_bias_load();
+    for (uint8_t i = 0; i < kNumImus; ++i) {
+        const ImuStatus st = kImuChannels[i]->begin(micros());
+        Serial.printf("[IMU] %-6s ICM-42688-P: %s\n", kImuNames[i], imu_status_str(st));
+    }
+    if (!start_imu_task(kImuChannels, kNumImus, IMU_TASK_CORE, IMU_TASK_PRIORITY))
+        Serial.println(F("[IMU] FATAL: could not start IMU task"));
+}
+
+#if IMU_TELEMETRY_PERIOD_MS > 0
+static void imu_telemetry() {
+    static uint32_t last_ms = 0;
+    const uint32_t now = millis();
+    if (now - last_ms < IMU_TELEMETRY_PERIOD_MS) return;
+    last_ms = now;
+    for (uint8_t i = 0; i < kNumImus; ++i) {
+        AttitudeState a;
+        if (!kImuChannels[i]->latest(a)) continue;
+        const uint32_t age = micros() - a.t_us;
+        Serial.printf("[IMU] %-6s r=%+7.3f p=%+7.3f y=%+8.3f deg T=%5.2fC bz=%+.4fdps w=%.2f clk=%.5f fl=0x%02x%s\n",
+                      kImuNames[i], a.roll * RAD_TO_DEG, a.pitch * RAD_TO_DEG, a.yaw * RAD_TO_DEG, a.temp_c,
+                      a.gyro_bias[2] * RAD_TO_DEG, a.accel_weight, a.clock_scale, a.flags,
+                      age > IMU_STALE_LIMIT_US ? " STALE" : "");
+    }
+}
+#endif
+
 void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.printf("[GIMBAL] Rev %s ESP32-S3 3-Axis SimpleFOC controller\n", GIMBAL_REVISION);
+
+    // 0. IMUs (SPI2, own task on core 0). Independent of the motor bring-up.
+    imu_setup();
 
     // 1. Encoder bus: I2C0 on GPIO17/18 -> TCA9548A @0x70 -> 3x AS5600 @0x36
     const bool enc_ok = encoders.begin(ENC_I2C_HZ);
@@ -193,6 +305,10 @@ void setup() {
 }
 
 void loop() {
+    if (Serial.available() && Serial.read() == 'B') imu_bias_save();
+#if IMU_TELEMETRY_PERIOD_MS > 0
+    imu_telemetry();
+#endif
     // One pass services all axes, so the next loopFOC() of an axis is one loop period away.
     const uint32_t now = micros();
     const float dt = (float)(now - g_last_loop_us) * 1e-6f;
