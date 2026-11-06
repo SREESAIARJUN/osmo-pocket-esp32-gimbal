@@ -149,6 +149,10 @@ static bool init_axis(Axis& ax, uint8_t idx) {
         ax.motor.disable();
         return false;
     }
+    // Hold the power-on pose. shaftAngle() is in the absolute AS5600 frame
+    // (sensor_offset = 0), so a 0 rad target made every axis slew at full
+    // voltage to an arbitrary magnet zero right after initFOC (Rev 7 review).
+    ax.target = ax.motor.shaft_angle;
     return true;
 }
 

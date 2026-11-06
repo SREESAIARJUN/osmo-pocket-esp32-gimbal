@@ -45,15 +45,22 @@ public:
     uint64_t  bits = 0;             // bits clocked, for timing estimates
     uint32_t  mux_writes = 0, begins = 0, ends = 0, transactions = 0;
     int       reset_pin = -1;
+    // Bus-hang fault injection: every transaction blocks for the full Wire
+    // timeout and fails (slave holding SDA/SCL low). A bus-clear (end/begin)
+    // releases it unless hang_survives_clear is set.
+    bool      hang = false;
+    bool      hang_survives_clear = false;
+    uint32_t  timeout_us = 2000;
 
     // ---- Arduino API ----
     bool begin(int, int, uint32_t f) { hz = f; begun = true; ++begins; return true; }
-    void end() { begun = false; ++ends; }
+    void end() { begun = false; ++ends; if (!hang_survives_clear) hang = false; }
     void setTimeOut(uint16_t) {}
     void beginTransmission(uint8_t a) { addr_ = a; tx_.clear(); }
     size_t write(uint8_t b) { tx_.push_back(b); return 1; }
     uint8_t endTransmission(bool = true) {
         ++transactions;
+        if (hang) { mock::now_us += timeout_us; return 5; }  // Arduino: 5 = timeout
         tick(1 + 9 + 9 * tx_.size() + 1);
         applyResetPin();
         if (addr_ == 0x70 && mux_present && !mux_nack) {
@@ -71,6 +78,7 @@ public:
     uint8_t requestFrom(uint8_t a, uint8_t n) {
         ++transactions;
         rx_.clear(); rx_pos_ = 0;
+        if (hang) { mock::now_us += timeout_us; return 0; }
         applyResetPin();
         if (a == 0x70 && mux_present && !mux_nack) {
             tick(1 + 9 + 9 * n + 1);

@@ -179,6 +179,52 @@ TEST(persistent_fault_latches_bus_fault_without_killing_other_axes) {
     CHECK(raw_of(rig.bus, 2) == 4000);
 }
 
+// Worst-case age of the newest sample across the given axes, as the FOC watchdog sees it.
+static uint32_t max_age(EncoderBus& bus) {
+    uint32_t m = 0;
+    for (uint8_t a = 0; a < 3; ++a) {
+        EncoderSample smp;
+        if (bus.health(a) == EncoderHealth::OK && bus.latest(a, smp)) {
+            uint32_t age = mock::now_us - smp.t_us;
+            if (age > m) m = age;
+        }
+    }
+    return m;
+}
+
+TEST(bus_hang_recovers_before_foc_stale_watchdog) {
+    // Review finding (Rev 7.0): with timeout-type faults (2 ms per transaction)
+    // a count-only trigger reached recovery after ~16-48 ms, after the 10 ms
+    // FOC watchdog had already latched the axes off. Recovery is now time-based.
+    Rig rig;
+    CHECK(rig.bus.begin());
+    rig.wire.hang = true;                    // e.g. a slave holding SDA low
+    uint32_t worst = 0;
+    for (int i = 0; i < 6; ++i) {
+        rig.bus.pollOnce();
+        uint32_t a = max_age(rig.bus);
+        if (a > worst) worst = a;
+    }
+    std::printf("  worst sample age through bus hang: %u us (watchdog %u us)\n",
+                worst, (unsigned)ENC_STALE_LIMIT_US);
+    CHECK(worst < ENC_STALE_LIMIT_US);
+    CHECK(rig.bus.recoveries() == 1);
+    for (int a = 0; a < 3; ++a) CHECK(rig.bus.health(a) == EncoderHealth::OK);
+    CHECK(rig.bus.pollOnce() == 3);
+}
+
+TEST(unrecoverable_bus_hang_latches_fault_quickly) {
+    Rig rig;
+    CHECK(rig.bus.begin());
+    rig.wire.hang = true;
+    rig.wire.hang_survives_clear = true;     // hard short: bus-clear cannot help
+    const uint32_t t0 = mock::now_us;
+    for (int i = 0; i < 20; ++i) rig.bus.pollOnce();
+    for (int a = 0; a < 3; ++a) CHECK(rig.bus.health(a) == EncoderHealth::BUS_FAULT);
+    CHECK(rig.bus.pollOnce() == 0);          // faulted axes no longer cost bus time
+    std::printf("  all axes BUS_FAULT after %u us\n", (unsigned)(mock::now_us - t0));
+}
+
 TEST(mux_select_is_cached) {
     TwoWire w; w.hz = 400000;
     TCA9548A mux(w, 0x70, -1);
