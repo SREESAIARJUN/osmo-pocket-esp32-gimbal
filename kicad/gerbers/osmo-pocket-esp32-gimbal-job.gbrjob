@@ -5,13 +5,13 @@
       "Application": "Pcbnew",
       "Version": "8.0.9-8.0.9-0~ubuntu24.04.1"
     },
-    "CreationDate": "2026-11-05T22:01:59+00:00"
+    "CreationDate": "2026-11-06T05:47:51+00:00"
   },
   "GeneralSpecs": {
     "ProjectId": {
       "Name": "osmo-pocket-esp32-gimbal",
       "GUID": "6f736d6f-2d70-46f6-936b-65742d657370",
-      "Revision": "1.0"
+      "Revision": "7.0"
     },
     "Size": {
       "X": 26.15,

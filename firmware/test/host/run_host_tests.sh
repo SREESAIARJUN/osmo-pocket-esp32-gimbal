@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Rev 7.0 host-side verification of the encoder mux stack and ESP32-S3 pin map.
+#  1. Builds the real firmware sources (tca9548a.cpp, as5600_mux.cpp) against
+#     Arduino/Wire/SimpleFOC mocks with -Wall -Wextra -Werror and runs the tests.
+#  2. Negative compile test: proves gimbal_pins.h rejects the Rev 6.0 GPIO22 SCL
+#     and a duplicated pin at compile time.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SRC="$HERE/../../src"
+OUT="$(mktemp -d)"
+trap 'rm -rf "$OUT"' EXIT
+CXX="${CXX:-g++}"
+FLAGS=(-std=c++17 -O1 -Wall -Wextra -Werror -I"$HERE/mock" -I"$SRC")
+
+echo "== build & run unit tests"
+"$CXX" "${FLAGS[@]}" -fsanitize=address,undefined \
+    "$HERE/test_encoder_mux.cpp" "$SRC/tca9548a.cpp" "$SRC/as5600_mux.cpp" -o "$OUT/t"
+"$OUT/t"
+
+echo "== negative pin-map compile tests"
+neg() {  # $1 description, $2 sed expression applied to a copy of gimbal_pins.h
+    mkdir -p "$OUT/neg"
+    sed "$2" "$SRC/gimbal_pins.h" > "$OUT/neg/gimbal_pins.h"
+    if echo '#include "gimbal_pins.h"' | "$CXX" -std=c++17 -fsyntax-only -I"$OUT/neg" -x c++ - 2>"$OUT/neg/err"; then
+        echo "  FAIL: $1 was accepted"; exit 1
+    fi
+    grep -q "static assertion failed\|static_assert" "$OUT/neg/err" \
+        || { echo "  FAIL: $1 rejected for the wrong reason:"; cat "$OUT/neg/err"; exit 1; }
+    echo "  PASS: $1 rejected at compile time"
+}
+neg "Rev 6.0 SCL on non-existent GPIO22" 's/ENC_I2C_SCL   = 18;/ENC_I2C_SCL   = 22;/'
+neg "octal-PSRAM GPIO35"                 's/IMU_CS_HANDLE  = 16;/IMU_CS_HANDLE  = 35;/'
+neg "strapping GPIO46"                   's/ENC_MUX_RST_N = 2;/ENC_MUX_RST_N = 46;/'
+neg "duplicate GPIO17"                   's/ENC_I2C_SCL   = 18;/ENC_I2C_SCL   = 17;/'
+neg "VBAT_SENSE moved off ADC1 (swap with GPIO21)" 's/VBAT_SENSE = 1;/VBAT_SENSE = 21;/;s/IMU_SPI_SCK    = 21;/IMU_SPI_SCK    = 1;/'
+echo "ALL HOST TESTS PASSED"

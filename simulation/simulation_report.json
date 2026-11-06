@@ -1,8 +1,36 @@
 {
-  "status": "PASS",
+  "status": "FAIL",
+  "horizon_lock_limit_deg": 0.05,
   "duration_sec": 2.0,
   "rms_disturbance_deg": 6.404261224798628,
-  "rms_stabilized_deg": 0.3962948702415291,
-  "vibration_attenuation_db": -24.169011748128444,
-  "stability_metric": "SUB-0.05_DEGREE_HORIZON_LOCK"
+  "rms_stabilized_deg": 0.39184740328097006,
+  "vibration_attenuation_db": -24.267041300735862,
+  "stability_metric": "HORIZON_LOCK_NOT_MET (0.392 deg RMS > 0.05 deg)",
+  "encoder_bus": {
+    "fast_read": {
+      "bits_per_sweep": 147,
+      "sweep_us": 367.5,
+      "per_axis_update_hz": 2721.0,
+      "worst_case_staleness_us": 367.5,
+      "commutation_error_deg_elec_at_1rad_s": 0.295,
+      "phase_lag_at_angle_crossover_deg": 0.794
+    },
+    "pointer_write_read": {
+      "bits_per_sweep": 207,
+      "sweep_us": 517.5,
+      "per_axis_update_hz": 1932.0,
+      "worst_case_staleness_us": 517.5,
+      "commutation_error_deg_elec_at_1rad_s": 0.415,
+      "phase_lag_at_angle_crossover_deg": 1.118
+    },
+    "bus_hz": 400000,
+    "mux": "TCA9548A @0x70, ch0=PAN ch1=ROLL ch2=PITCH, AS5600 @0x36 each",
+    "pins": "I2C0 SDA=GPIO17 SCL=GPIO18, MUX RESET_N=GPIO2 (Rev 6 SCL=GPIO22 does not exist on ESP32-S3)",
+    "resolution_deg_mech": 0.0879,
+    "acceptance": {
+      "per_axis_update_hz_min": 2000,
+      "commutation_error_deg_elec_max": 15.0,
+      "status": "PASS"
+    }
+  }
 }

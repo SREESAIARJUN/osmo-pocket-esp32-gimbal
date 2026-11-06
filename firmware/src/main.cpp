@@ -1,120 +1,145 @@
 /**
- * ESP32-S3 3-Axis Ultra-Smooth Gimbal Controller
+ * ESP32-S3 3-Axis Ultra-Smooth Gimbal Controller — Revision 7.0
  * Framework: Arduino-ESP32 / SimpleFOC
- * Hardware: 3x TMC6300 BLDC Drivers, 3x AS5600 14-bit Encoders, Dual ICM-42688-P IMUs
+ * Hardware: 3x TMC6300 BLDC drivers, 3x AS5600 12-bit encoders behind a
+ *           TCA9548A I2C switch, dual ICM-42688-P IMUs (SPI)
+ *
+ * Rev 7.0 encoder architecture:
+ *   core 0: EncoderBus task sweeps TCA9548A ch0..2 -> AS5600 RAW ANGLE (~2.6 kHz/axis)
+ *   core 1: loop() runs loopFOC()/move() for all three axes on cached samples
  */
 
 #include <Arduino.h>
 #include <SimpleFOC.h>
 #include <Wire.h>
 #include <SPI.h>
+#include "gimbal_pins.h"
+#include "gimbal_config.h"
+#include "tca9548a.h"
+#include "as5600_mux.h"
 #include "anti_cogging.h"
 
-// BLDC Motor & Driver Instances: Pan, Roll, Pitch
-// Motors: 14 pole pairs (28 poles), 12N14P gimbal motors
-BLDCMotor motorPan = BLDCMotor(14);
-BLDCDriver3PWM driverPan = BLDCDriver3PWM(4, 5, 6, 7); // PWM_A, PWM_B, PWM_C, EN
+// ---------------------------------------------------------------------------
+// Encoder bus: one TCA9548A, three AS5600 (all at 0x36) on separate channels
+// ---------------------------------------------------------------------------
+static TCA9548A encMux(Wire, ENC_MUX_ADDR, pins::ENC_MUX_RST_N);
+static const uint8_t kEncChannels[EncoderBus::NUM_AXES] = {
+    ENC_MUX_CH_PAN, ENC_MUX_CH_ROLL, ENC_MUX_CH_PITCH};
+static EncoderBus encoders(Wire, encMux, pins::ENC_I2C_SDA, pins::ENC_I2C_SCL, kEncChannels);
 
-BLDCMotor motorRoll = BLDCMotor(14);
-BLDCDriver3PWM driverRoll = BLDCDriver3PWM(8, 9, 10, 11);
+static MuxedAS5600 sensorPan(encoders, 0);
+static MuxedAS5600 sensorRoll(encoders, 1);
+static MuxedAS5600 sensorPitch(encoders, 2);
 
-BLDCMotor motorPitch = BLDCMotor(14);
-BLDCDriver3PWM driverPitch = BLDCDriver3PWM(12, 13, 14, 15);
+// ---------------------------------------------------------------------------
+// BLDC motors & drivers: Pan, Roll, Pitch (12N14P gimbal motors)
+// ---------------------------------------------------------------------------
+static BLDCMotor motorPan(MOTOR_POLE_PAIRS);
+static BLDCDriver3PWM driverPan(pins::PAN_PWM_A, pins::PAN_PWM_B, pins::PAN_PWM_C, pins::PAN_EN);
 
-// Magnetic Encoders (AS5600 via I2C / multiplexer or SPI)
-MagneticSensorI2C sensorPan = MagneticSensorI2C(AS5600_I2C);
-MagneticSensorI2C sensorRoll = MagneticSensorI2C(AS5600_I2C);
-MagneticSensorI2C sensorPitch = MagneticSensorI2C(AS5600_I2C);
+static BLDCMotor motorRoll(MOTOR_POLE_PAIRS);
+static BLDCDriver3PWM driverRoll(pins::ROLL_PWM_A, pins::ROLL_PWM_B, pins::ROLL_PWM_C, pins::ROLL_EN);
 
-// Cascaded Target Angles
-float target_pan = 0.0f;
-float target_roll = 0.0f;
-float target_pitch = 0.0f;
+static BLDCMotor motorPitch(MOTOR_POLE_PAIRS);
+static BLDCDriver3PWM driverPitch(pins::PITCH_PWM_A, pins::PITCH_PWM_B, pins::PITCH_PWM_C, pins::PITCH_EN);
+
+struct Axis {
+    const char*     name;
+    BLDCMotor&      motor;
+    BLDCDriver3PWM& driver;
+    MuxedAS5600&    sensor;
+    float kp, ki, kd, vlimit;
+    float target;
+    bool  active;
+};
+
+static Axis axes[EncoderBus::NUM_AXES] = {
+    {"PAN",   motorPan,   driverPan,   sensorPan,   PAN_KP,   PAN_KI,   PAN_KD,   PAN_VOLTAGE_LIMIT,   0.0f, false},
+    {"ROLL",  motorRoll,  driverRoll,  sensorRoll,  ROLL_KP,  ROLL_KI,  ROLL_KD,  ROLL_VOLTAGE_LIMIT,  0.0f, false},
+    {"PITCH", motorPitch, driverPitch, sensorPitch, PITCH_KP, PITCH_KI, PITCH_KD, PITCH_VOLTAGE_LIMIT, 0.0f, false},
+};
+
+static bool init_axis(Axis& ax, uint8_t idx) {
+    if (!ax.sensor.healthy()) {
+        Serial.printf("[GIMBAL] %s encoder %s -> axis left DISABLED\n", ax.name,
+                      encoder_health_str(encoders.health(idx)));
+        return false;
+    }
+    ax.sensor.init();
+    ax.motor.linkSensor(&ax.sensor);
+
+    ax.driver.pwm_frequency        = FOC_PWM_FREQ;
+    ax.driver.voltage_power_supply = SUPPLY_VOLTAGE;
+    if (!ax.driver.init()) {
+        Serial.printf("[GIMBAL] %s driver init FAILED (no PWM timer?)\n", ax.name);
+        return false;
+    }
+    ax.motor.linkDriver(&ax.driver);
+
+    ax.motor.controller    = MotionControlType::angle;
+    ax.motor.P_angle.P     = ax.kp;
+    ax.motor.P_angle.I     = ax.ki;
+    ax.motor.P_angle.D     = ax.kd;
+    ax.motor.voltage_limit = ax.vlimit;
+
+    ax.motor.init();
+    if (!ax.motor.initFOC()) {
+        Serial.printf("[GIMBAL] %s initFOC FAILED\n", ax.name);
+        ax.motor.disable();
+        return false;
+    }
+    return true;
+}
 
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println(F("[GIMBAL] Initializing ESP32-S3 3-Axis SimpleFOC Controller..."));
+    Serial.printf("[GIMBAL] Rev %s ESP32-S3 3-Axis SimpleFOC controller\n", GIMBAL_REVISION);
 
-    // 1. Initialize Encoders
-    Wire.begin(21, 22, 400000); // SDA, SCL @ 400kHz
-    sensorPan.init();
-    sensorRoll.init();
-    sensorPitch.init();
+    // 1. Encoder bus: I2C0 on GPIO17/18 -> TCA9548A @0x70 -> 3x AS5600 @0x36
+    const bool enc_ok = encoders.begin(ENC_I2C_HZ);
+    for (uint8_t i = 0; i < EncoderBus::NUM_AXES; ++i) {
+        Serial.printf("[ENC] %-5s mux ch%u: %s AGC=%u fast_read=%s\n", axes[i].name,
+                      kEncChannels[i], encoder_health_str(encoders.health(i)),
+                      encoders.agc(i), encoders.fastReadEnabled(i) ? "yes" : "no");
+    }
+    if (!enc_ok) Serial.println(F("[ENC] WARNING: not all encoders healthy"));
+    if (!encoders.startTask(ENC_TASK_CORE, ENC_TASK_PRIORITY)) {
+        Serial.println(F("[ENC] FATAL: could not start encoder task; motors stay disabled"));
+        return;
+    }
+    delay(5);  // let the task publish fresh samples before Sensor::init()
 
-    // 2. Link Encoders to Motors
-    motorPan.linkSensor(&sensorPan);
-    motorRoll.linkSensor(&sensorRoll);
-    motorPitch.linkSensor(&sensorPitch);
+    // 2. Per-axis driver/motor/FOC bring-up. A faulty encoder never energises its motor.
+    for (uint8_t i = 0; i < EncoderBus::NUM_AXES; ++i) axes[i].active = init_axis(axes[i], i);
 
-    // 3. Driver PWM Setup (20kHz carrier for silent FOC operation)
-    driverPan.pwm_frequency = 20000;
-    driverRoll.pwm_frequency = 20000;
-    driverPitch.pwm_frequency = 20000;
-    
-    driverPan.voltage_power_supply = 7.4f; // 2S Li-ion
-    driverRoll.voltage_power_supply = 7.4f;
-    driverPitch.voltage_power_supply = 7.4f;
-
-    driverPan.init();
-    driverRoll.init();
-    driverPitch.init();
-
-    motorPan.linkDriver(&driverPan);
-    motorRoll.linkDriver(&driverRoll);
-    motorPitch.linkDriver(&driverPitch);
-
-    // 4. Control Modes & PID Parameters
-    motorPan.controller = MotionControlType::angle;
-    motorRoll.controller = MotionControlType::angle;
-    motorPitch.controller = MotionControlType::angle;
-
-    // Pan PID
-    motorPan.P_angle.P = 18.0f;
-    motorPan.P_angle.I = 0.8f;
-    motorPan.P_angle.D = 0.12f;
-    motorPan.voltage_limit = 4.5f;
-
-    // Roll PID (Critical Horizon Lock)
-    motorRoll.P_angle.P = 22.0f;
-    motorRoll.P_angle.I = 1.2f;
-    motorRoll.P_angle.D = 0.18f;
-    motorRoll.voltage_limit = 4.5f;
-
-    // Pitch PID
-    motorPitch.P_angle.P = 16.0f;
-    motorPitch.P_angle.I = 0.6f;
-    motorPitch.P_angle.D = 0.10f;
-    motorPitch.voltage_limit = 4.0f;
-
-    // 5. Initialize FOC Loops
-    motorPan.init();
-    motorRoll.init();
-    motorPitch.init();
-
-    motorPan.initFOC();
-    motorRoll.initFOC();
-    motorPitch.initFOC();
-
-    Serial.println(F("[GIMBAL] FOC Alignment Complete. Initializing Anti-Cogging Compensation..."));
+    Serial.println(F("[GIMBAL] FOC alignment complete. Initializing anti-cogging compensation..."));
     init_anti_cogging();
-
-    Serial.println(F("[GIMBAL] Ready. Closed-loop Stabilization ACTIVE."));
+    Serial.println(F("[GIMBAL] Ready. Closed-loop stabilization ACTIVE."));
 }
 
 void loop() {
-    // 1. High-frequency FOC loop execution (~10 kHz)
-    motorPan.loopFOC();
-    motorRoll.loopFOC();
-    motorPitch.loopFOC();
+    for (uint8_t i = 0; i < EncoderBus::NUM_AXES; ++i) {
+        Axis& ax = axes[i];
+        if (!ax.active) continue;
 
-    // 2. Anti-cogging feedforward torque injection
-    motorPan.voltage.q += get_anti_cogging_torque(0, sensorPan.getAngle());
-    motorRoll.voltage.q += get_anti_cogging_torque(1, sensorRoll.getAngle());
-    motorPitch.voltage.q += get_anti_cogging_torque(2, sensorPitch.getAngle());
+        // Encoder watchdog: never commutate on a stale or faulted angle.
+        if (!ax.sensor.healthy() || ax.sensor.sampleAgeUs() > ENC_STALE_LIMIT_US) {
+            ax.motor.disable();
+            ax.active = false;
+            Serial.printf("[GIMBAL] %s encoder %s / stale -> axis DISABLED\n", ax.name,
+                          encoder_health_str(encoders.health(i)));
+            continue;
+        }
 
-    // 3. Motion control update
-    motorPan.move(target_pan);
-    motorRoll.move(target_roll);
-    motorPitch.move(target_pitch);
+        // loopFOC() applies voltage.q computed by the previous move(); move()
+        // recomputes it, then the anti-cogging feed-forward is added so that the
+        // NEXT loopFOC() actually applies it (Rev <= 6.0 added it before move(),
+        // which overwrote it every cycle).
+        ax.motor.loopFOC();
+        ax.motor.move(ax.target);
+        ax.motor.voltage.q = _constrain(
+            ax.motor.voltage.q + get_anti_cogging_torque(i, ax.sensor.getMechanicalAngle()),
+            -ax.motor.voltage_limit, ax.motor.voltage_limit);
+    }
 }

@@ -13,7 +13,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-def run_simulation(duration_sec=2.0, dt=0.001):
+HORIZON_LOCK_LIMIT_DEG = 0.05  # spec: < 0.05 deg RMS roll error
+
+
+def run_simulation(duration_sec=2.0, dt=0.001, seed=7):
+    rng = np.random.default_rng(seed)  # reproducible sensor noise
     steps = int(duration_sec / dt)
     t = np.linspace(0, duration_sec, steps)
 
@@ -46,7 +50,7 @@ def run_simulation(duration_sec=2.0, dt=0.001):
         target = 0.0
         
         # Sensor feedback: true camera roll + IMU noise
-        sensor_roll = camera_roll[i-1] + np.random.normal(0, 0.0005)
+        sensor_roll = camera_roll[i-1] + rng.normal(0, 0.0005)
         
         # PID Error
         err = target - sensor_roll
@@ -87,14 +91,27 @@ def run_simulation(duration_sec=2.0, dt=0.001):
     rms_disturbance = np.sqrt(np.mean(base_roll**2))
     attenuation_db = 20 * np.log10(rms_stabilized / rms_disturbance)
 
+    # Rev 7.0: verdict is computed from the metric. Up to Rev 6.0 it was hard-coded
+    # to "PASS"/"SUB-0.05_DEGREE_HORIZON_LOCK" regardless of the measured RMS error.
+    rms_deg = float(np.degrees(rms_stabilized))
+    passed = rms_deg < HORIZON_LOCK_LIMIT_DEG
     report = {
-        "status": "PASS",
+        "status": "PASS" if passed else "FAIL",
+        "horizon_lock_limit_deg": HORIZON_LOCK_LIMIT_DEG,
         "duration_sec": duration_sec,
         "rms_disturbance_deg": float(np.degrees(rms_disturbance)),
         "rms_stabilized_deg": float(np.degrees(rms_stabilized)),
         "vibration_attenuation_db": float(attenuation_db),
-        "stability_metric": "SUB-0.05_DEGREE_HORIZON_LOCK"
+        "stability_metric": ("SUB-0.05_DEGREE_HORIZON_LOCK" if passed
+                             else f"HORIZON_LOCK_NOT_MET ({rms_deg:.3f} deg RMS > {HORIZON_LOCK_LIMIT_DEG} deg)"),
     }
+    try:  # merge Rev 7.0 encoder-bus budget if it has been generated
+        with open('simulation_report.json') as f:
+            prev = json.load(f)
+        if "encoder_bus" in prev:
+            report["encoder_bus"] = prev["encoder_bus"]
+    except (OSError, ValueError):
+        pass
 
     with open('simulation_report.json', 'w') as f:
         json.dump(report, f, indent=2)
