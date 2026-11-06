@@ -57,7 +57,9 @@ struct Harmonic {
 struct HarmonicSet {
     Harmonic h[MAX_HARMONICS];
     uint8_t  count = 0;
-    bool add(uint8_t order, float amp_nm, float phase_rad);
+    // order is taken as int and range-checked (1 .. LUT_SIZE/2-1): a uint8_t
+    // parameter silently truncated e.g. 268 -> 12 (Rev 57 fix).
+    bool add(int order, float amp_nm, float phase_rad);
 };
 
 // Wrap any finite angle into [0, 2*pi). Non-finite input returns NaN.

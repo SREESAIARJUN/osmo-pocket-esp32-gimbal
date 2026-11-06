@@ -106,7 +106,10 @@ public:
     struct Config {
         float b0_sigma0   = 0.0175f;    // rad/s (1 dps) prior on the offset
         float b1_sigma0   = 1.75e-4f;   // rad/s/degC (0.01 dps/degC) prior on the slope
-        float q_b0        = 1.0e-9f;    // (rad/s)^2 per s  random walk (bias instability)
+        // Offset random walk: 1e-11 (rad/s)^2/s = 0.0018 dps per 100 s, in line with the
+        // ICM-42688-P bias instability. 1e-9 forgot old windows within seconds and
+        // made the slope estimate noisy (host test: 1.05 deg vs 0.4 deg warm-up yaw drift).
+        float q_b0        = 1.0e-11f;   // (rad/s)^2 per s
         float q_b1        = 1.0e-13f;   // (rad/s/degC)^2 per s
         float r_floor     = 1.0e-9f;    // (rad/s)^2  measurement-noise floor (vibration, quantisation)
         float gate_sigma  = 5.0f;       // innovation gate

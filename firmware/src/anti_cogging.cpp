@@ -11,9 +11,11 @@ static_assert(fundamental_order(MOTOR_STATOR_SLOTS, MOTOR_POLE_PAIRS) * MOTOR_PO
 static_assert(ANTI_COGGING_ORDER < LUT_SIZE / 4,
               "highest retained harmonic needs >= 4 LUT points per period");
 
-bool HarmonicSet::add(uint8_t order, float amp_nm, float phase_rad) {
-    if (count >= MAX_HARMONICS || order == 0 || !isfinite(amp_nm) || !isfinite(phase_rad)) return false;
-    h[count++] = {order, amp_nm, phase_rad};
+bool HarmonicSet::add(int order, float amp_nm, float phase_rad) {
+    if (count >= MAX_HARMONICS || order <= 0 || order >= LUT_SIZE / 2 || order > 255 ||
+        !isfinite(amp_nm) || !isfinite(phase_rad))
+        return false;
+    h[count++] = {static_cast<uint8_t>(order), amp_nm, phase_rad};
     return true;
 }
 
@@ -44,6 +46,7 @@ void Lut::clear() {
 }
 
 bool Lut::build(const HarmonicSet& hs) {
+    if (hs.count == 0) return false;  // an empty set would silently zero the table
     for (uint8_t k = 0; k < hs.count; ++k) {
         const Harmonic& h = hs.h[k];
         if (h.order == 0 || h.order >= LUT_SIZE / 2 || !isfinite(h.amp_nm) || !isfinite(h.phase_rad))

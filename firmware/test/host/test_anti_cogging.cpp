@@ -92,8 +92,10 @@ static void test_lut_synthesis_and_interpolation() {
     NEAR(lut.sample(NAN), 0.0f, 0);
 
     // Aliasing / invalid harmonic sets are rejected and keep the old table
-    HarmonicSet bad; bad.add(LUT_SIZE / 2, 1.0f, 0.0f);
-    CHECK(!lut.build(bad));
+    HarmonicSet bad; CHECK(!bad.add(LUT_SIZE / 2, 1.0f, 0.0f));   // Nyquist order rejected, not truncated
+    CHECK(!bad.add(268, 1.0f, 0.0f));                              // was silently accepted as order 12
+    CHECK(bad.count == 0);
+    CHECK(!lut.build(bad));                                        // empty set keeps the previous table
     CHECK(lut.valid());
     NEAR(lut.point(5), model(5 * h), 1e-9);
     HarmonicSet bad2; CHECK(!bad2.add(12, NAN, 0.0f)); CHECK(!bad2.add(0, 1.0f, 0.0f));
@@ -204,14 +206,19 @@ static void test_feedforward() {
     FeedforwardParams p; p.kt = 0.035f; p.phase_r = 8.5f; p.vq_limit = 0.5f; p.fade_start = 20; p.fade_end = 120;
     const float th = (float)(kPi / 24);                       // sin(12*th) = 1 -> peak cogging
     const float vpk = 4.0e-4f * 8.5f / 0.035f;                // 0.0971 V
-    NEAR(feedforward_vq(lut, p, th, 0, 0), -vpk, 1e-4);       // opposes cogging
-    NEAR(feedforward_vq(lut, p, th + (float)kPi / 12, 0, 0), vpk, 1e-4);  // half a cogging period later
+    // th sits between LUT points (index 10.67): linear interpolation of the 12th
+    // harmonic undershoots the peak by 0.24 %. Tolerance = the 0.5 % interpolation
+    // bound proven in test_lut_synthesis_and_interpolation (was 1e-4 V = 0.1 %,
+    // which hid behind a compile error until Rev 57).
+    const float tol = 0.005f * vpk;
+    NEAR(feedforward_vq(lut, p, th, 0, 0), -vpk, tol);       // opposes cogging
+    NEAR(feedforward_vq(lut, p, th + (float)kPi / 12, 0, 0), vpk, tol);  // half a cogging period later
     // Phase advance: evaluating at theta - w*T with latency T equals evaluating at theta
     NEAR(feedforward_vq(lut, p, th - 10.0f * 1e-3f, 10.0f, 1e-3f), feedforward_vq(lut, p, th, 0, 0), 2e-4);
     // Speed fade: full below start, half in the middle, zero above end, symmetric in sign
-    NEAR(feedforward_vq(lut, p, th - 70e-3f * 0, 70.0f, 0) , -vpk * 0.5f, 1e-4);
-    NEAR(feedforward_vq(lut, p, th, -70.0f, 0), -vpk * 0.5f, 1e-4);
-    NEAR(feedforward_vq(lut, p, th, 19.0f, 0), -vpk, 1e-4);
+    NEAR(feedforward_vq(lut, p, th, 70.0f, 0), -vpk * 0.5f, tol);
+    NEAR(feedforward_vq(lut, p, th, -70.0f, 0), -vpk * 0.5f, tol);
+    NEAR(feedforward_vq(lut, p, th, 19.0f, 0), -vpk, tol);
     NEAR(feedforward_vq(lut, p, th, 120.0f, 0), 0.0f, 0);
     NEAR(feedforward_vq(lut, p, th, 500.0f, 0), 0.0f, 0);
     // Clamp

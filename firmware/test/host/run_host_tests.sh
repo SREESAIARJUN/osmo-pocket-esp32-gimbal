@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rev 7.0/8.0 host-side verification of the encoder mux stack, ESP32-S3 pin map
+# Rev 7.0/8.0/57.0 host-side verification of the encoder mux stack, ESP32-S3 pin map
 # and (Rev 8.0) the anti-cogging LUT / electrical-angle / feed-forward math.
 #  1. Builds the real firmware sources (tca9548a.cpp, as5600_mux.cpp) against
 #     Arduino/Wire/SimpleFOC mocks with -Wall -Wextra -Werror and runs the tests.
@@ -25,6 +25,17 @@ echo "== build & run anti-cogging tests (Rev 8.0)"
     -c "$SRC/anti_cogging.cpp" -o "$OUT/anti_cogging.o"
 "$CXX" "${FLAGS[@]}" -fsanitize=address,undefined "$HERE/test_anti_cogging.cpp" "$OUT/anti_cogging.o" -o "$OUT/ac"
 "$OUT/ac"
+
+echo "== build & run IMU tests (Rev 57.0: ICM-42688-P FIFO, Madgwick AHRS, gyro bias(T))"
+# Same single-precision gate as anti-cogging: these run at 1 kHz x 2 IMUs on core 0.
+IMU_OBJS=()
+for m in icm42688 madgwick_ahrs imu_bias imu_pipeline; do
+    "$CXX" "${FLAGS[@]}" -Wconversion -Wdouble-promotion -Wshadow -fsanitize=address,undefined \
+        -c "$SRC/$m.cpp" -o "$OUT/$m.o"
+    IMU_OBJS+=("$OUT/$m.o")
+done
+"$CXX" "${FLAGS[@]}" -O2 -fsanitize=address,undefined "$HERE/test_imu.cpp" "${IMU_OBJS[@]}" -o "$OUT/imu"
+"$OUT/imu"
 
 echo "== negative pin-map compile tests"
 neg() {  # $1 description, $2 sed expression applied to a copy of gimbal_pins.h
