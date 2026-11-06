@@ -1,5 +1,5 @@
 /**
- * ESP32-S3 3-Axis Ultra-Smooth Gimbal Controller — Revision 57.0
+ * ESP32-S3 3-Axis Ultra-Smooth Gimbal Controller — Revision 59.0
  * Framework: Arduino-ESP32 / SimpleFOC
  * Hardware: 3x TMC6300 BLDC drivers, 3x AS5600 12-bit encoders behind a
  *           TCA9548A I2C switch, dual ICM-42688-P IMUs (SPI)
@@ -21,6 +21,15 @@
  *   NVS:    the learned gyro bias(T) model is restored at boot and saved on
  *           the 'B' serial command while all motors are idle (flash writes
  *           stall both cores' caches, so never while commutating).
+ *
+ * Rev 59.0 thumb joystick:
+ *   core 0: joy_adc task (prio 3, 200 Hz) reads JOY_X/JOY_Y on ADC1, runs the
+ *           dynamic-deadband + exponential-curve + ease/accel-limit shaper
+ *           (joystick_shaper.h) and publishes rad/s rate commands via seqlock.
+ *   core 1: loop() integrates the rates into the PAN / PITCH angle targets
+ *           with soft travel limits around the power-on pose; a command older
+ *           than JOY_STALE_LIMIT_US is treated as zero rate (no runaway if the
+ *           task ever stops). 'P' toggles precision mode.
  */
 
 #include <Arduino.h>
@@ -34,6 +43,7 @@
 #include "anti_cogging.h"
 #include "icm42688.h"
 #include "imu_pipeline.h"
+#include "joystick_input.h"
 #include <Preferences.h>
 
 // ---------------------------------------------------------------------------
@@ -101,12 +111,18 @@ struct Axis {
     float kp, ki, kd, vlimit;
     float target;
     bool  active;
+    int8_t joy_axis;   // joystick axis driving this motor (-1: none)
+    float  joy_limit;  // rad around `home` the joystick may move the target (0: unlimited)
+    float  home;       // power-on pose (set by init_axis)
 };
 
 static Axis axes[EncoderBus::NUM_AXES] = {
-    {"PAN",   motorPan,   driverPan,   sensorPan,   PAN_KP,   PAN_KI,   PAN_KD,   PAN_VOLTAGE_LIMIT,   0.0f, false},
-    {"ROLL",  motorRoll,  driverRoll,  sensorRoll,  ROLL_KP,  ROLL_KI,  ROLL_KD,  ROLL_VOLTAGE_LIMIT,  0.0f, false},
-    {"PITCH", motorPitch, driverPitch, sensorPitch, PITCH_KP, PITCH_KI, PITCH_KD, PITCH_VOLTAGE_LIMIT, 0.0f, false},
+    {"PAN",   motorPan,   driverPan,   sensorPan,   PAN_KP,   PAN_KI,   PAN_KD,   PAN_VOLTAGE_LIMIT,   0.0f, false,
+     0,  JOY_PAN_LIMIT_RAD,   0.0f},
+    {"ROLL",  motorRoll,  driverRoll,  sensorRoll,  ROLL_KP,  ROLL_KI,  ROLL_KD,  ROLL_VOLTAGE_LIMIT,  0.0f, false,
+     -1, 0.0f,                0.0f},   // roll holds the horizon; never joystick-driven
+    {"PITCH", motorPitch, driverPitch, sensorPitch, PITCH_KP, PITCH_KI, PITCH_KD, PITCH_VOLTAGE_LIMIT, 0.0f, false,
+     1,  JOY_PITCH_LIMIT_RAD, 0.0f},
 };
 
 // Loop timing for the anti-cogging phase advance (time until the next loopFOC()).
@@ -198,6 +214,7 @@ static bool init_axis(Axis& ax, uint8_t idx) {
     // (sensor_offset = 0), so a 0 rad target made every axis slew at full
     // voltage to an arbitrary magnet zero right after initFOC (Rev 7 review).
     ax.target = ax.motor.shaft_angle;
+    ax.home   = ax.target;  // Rev 59: joystick travel limits are relative to this pose
     return true;
 }
 
@@ -247,6 +264,72 @@ static void imu_setup() {
         Serial.println(F("[IMU] FATAL: could not start IMU task"));
 }
 
+#if JOY_ENABLE
+static joy::Config joy_config() {
+    constexpr float D2R = 0.017453292519943f;
+    joy::Config c;
+    c.db_base            = JOY_DB_BASE;
+    c.db_noise_k         = JOY_DB_NOISE_K;
+    c.db_min             = JOY_DB_MIN;
+    c.db_max             = JOY_DB_MAX;
+    c.release_radius     = JOY_RELEASE_RADIUS;
+    c.release_tau_s      = JOY_RELEASE_TAU_S;
+    c.expo_k[0]          = JOY_PAN_EXPO_K;
+    c.expo_k[1]          = JOY_PITCH_EXPO_K;
+    c.max_rate[0]        = JOY_PAN_MAX_RATE_DPS * D2R;
+    c.max_rate[1]        = JOY_PITCH_MAX_RATE_DPS * D2R;
+    c.max_accel[0]       = JOY_PAN_MAX_ACCEL_DPS2 * D2R;
+    c.max_accel[1]       = JOY_PITCH_MAX_ACCEL_DPS2 * D2R;
+    c.sign[0]            = JOY_PAN_INVERT ? -1.0f : 1.0f;
+    c.sign[1]            = JOY_PITCH_INVERT ? -1.0f : 1.0f;
+    c.smooth_tau_s       = JOY_SMOOTH_TAU_S;
+    c.precision_scale    = JOY_PRECISION_SCALE;
+    return c;
+}
+
+/**
+ * Integrate the joystick rate commands into the joystick-driven axis targets.
+ * Called once per loop() pass with the measured pass period.
+ */
+static void joystick_apply(uint32_t now_us, float dt) {
+    static bool stale_reported = false;
+    float rate[joy::AXES] = {0.0f, 0.0f};
+    joy::Command jc;
+    if (joystick_latest(jc)) {
+        // Signed age: the producer on core 0 may stamp a time just after `now_us`.
+        const int32_t age = (int32_t)(now_us - jc.t_us);
+        if (age <= (int32_t)JOY_STALE_LIMIT_US) {
+            for (uint8_t a = 0; a < joy::AXES; ++a) rate[a] = jc.rate[a];
+            stale_reported = false;
+        } else if (!stale_reported) {
+            stale_reported = true;
+            Serial.printf("[JOY] command stale (%ld us) -> rate 0\n", (long)age);
+        }
+    }
+    for (uint8_t i = 0; i < EncoderBus::NUM_AXES; ++i) {
+        Axis& ax = axes[i];
+        if (!ax.active || ax.joy_axis < 0) continue;
+        const float r = joy::soft_limit_rate(rate[ax.joy_axis], ax.target - ax.home, ax.joy_limit,
+                                             JOY_SOFT_ZONE_RAD);
+        ax.target += r * dt;
+    }
+}
+
+#if JOY_TELEMETRY_PERIOD_MS > 0
+static void joy_telemetry() {
+    static uint32_t last_ms = 0;
+    const uint32_t now = millis();
+    if (now - last_ms < JOY_TELEMETRY_PERIOD_MS) return;
+    last_ms = now;
+    joy::Command c;
+    if (!joystick_latest(c)) return;
+    Serial.printf("[JOY] u=%+.3f,%+.3f s=%+.3f,%+.3f w=%+7.2f,%+7.2f dps r=%.3f sig=%.4f,%.4f c=%.0f,%.0f fl=0x%02lx\n",
+                  c.norm[0], c.norm[1], c.shaped[0], c.shaped[1], c.rate[0] * RAD_TO_DEG, c.rate[1] * RAD_TO_DEG,
+                  c.radius, c.sigma[0], c.sigma[1], c.center_mv[0], c.center_mv[1], (unsigned long)c.flags);
+}
+#endif
+#endif  // JOY_ENABLE
+
 #if IMU_TELEMETRY_PERIOD_MS > 0
 static void imu_telemetry() {
     static uint32_t last_ms = 0;
@@ -272,6 +355,14 @@ void setup() {
 
     // 0. IMUs (SPI2, own task on core 0). Independent of the motor bring-up.
     imu_setup();
+
+#if JOY_ENABLE
+    // 0b. Joystick (ADC1 owner task on core 0). Started before the multi-second
+    // FOC alignment so the 0.5 s centre calibration is done long before any
+    // command could be applied; nothing is published until it completes.
+    if (!start_joystick_task(joy_config(), JOY_TASK_CORE, JOY_TASK_PRIORITY))
+        Serial.println(F("[JOY] could not start joystick task -> joystick disabled"));
+#endif
 
     // 1. Encoder bus: I2C0 on GPIO17/18 -> TCA9548A @0x70 -> 3x AS5600 @0x36
     const bool enc_ok = encoders.begin(ENC_I2C_HZ);
@@ -305,15 +396,34 @@ void setup() {
 }
 
 void loop() {
-    if (Serial.available() && Serial.read() == 'B') imu_bias_save();
+    if (Serial.available()) {
+        switch (Serial.read()) {
+            case 'B': imu_bias_save(); break;
+#if JOY_ENABLE
+            case 'P':
+                joystick_set_precision(!joystick_precision());
+                Serial.printf("[JOY] precision mode %s\n", joystick_precision() ? "ON" : "OFF");
+                break;
+#endif
+            default: break;
+        }
+    }
 #if IMU_TELEMETRY_PERIOD_MS > 0
     imu_telemetry();
+#endif
+#if JOY_ENABLE && JOY_TELEMETRY_PERIOD_MS > 0
+    joy_telemetry();
 #endif
     // One pass services all axes, so the next loopFOC() of an axis is one loop period away.
     const uint32_t now = micros();
     const float dt = (float)(now - g_last_loop_us) * 1e-6f;
     g_last_loop_us = now;
     if (dt > 0.0f && dt < 0.01f) g_loop_dt_s += 0.05f * (dt - g_loop_dt_s);
+#if JOY_ENABLE
+    // Integrate over the real pass period; a pathological pass (USB-CDC stall)
+    // is bounded so a held stick never produces a target jump.
+    joystick_apply(now, (dt > 0.0f && dt < 0.02f) ? dt : g_loop_dt_s);
+#endif
 
     for (uint8_t i = 0; i < EncoderBus::NUM_AXES; ++i) {
         Axis& ax = axes[i];

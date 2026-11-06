@@ -1,8 +1,8 @@
-// SimpleFOC Tuning & Configuration Profile - Revision 57.0 / 150
+// SimpleFOC Tuning & Configuration Profile - Revision 59.0 / 150
 #ifndef GIMBAL_CONFIG_H
 #define GIMBAL_CONFIG_H
 
-#define GIMBAL_REVISION "57.0"
+#define GIMBAL_REVISION "59.0"
 
 // ---- Angle-loop PID (consumed by main.cpp; previously hard-coded there) ----
 #define PAN_KP   18.00f
@@ -84,6 +84,43 @@
 #define GYRO_BIAS_B1_SIGMA_DPS_C   0.01f
 #ifndef IMU_TELEMETRY_PERIOD_MS
 #define IMU_TELEMETRY_PERIOD_MS    0        // >0: print attitude/bias from loop() at this period
+#endif
+
+// ---- Thumb joystick rate control (Rev 59.0): joy_adc task, joystick_shaper.h ----
+#define JOY_ENABLE                1
+#define JOY_TASK_CORE             0        // with the IMU/encoder tasks, away from FOC on core 1
+#define JOY_TASK_PRIORITY         3        // < ENC (5) < IMU (6): a late joystick tick is harmless
+#define JOY_PERIOD_MS             5        // 200 Hz: 10x the ~20 Hz bandwidth of a thumb
+#define JOY_OVERSAMPLE            4
+#define JOY_CAL_SAMPLES           100      // 0.5 s boot centre calibration, thumb off the stick
+#define JOY_CENTER_NOMINAL_MV     1650.0f  // VDD/2 of the ratiometric pot
+#define JOY_CENTER_MAX_OFFSET_MV  350.0f
+#define JOY_CENTER_MAX_STD_MV     20.0f
+#define JOY_STALE_LIMIT_US        50000    // consumer watchdog: older command => rate 0 (10 missed ticks)
+// Curves: f(s) = (e^{k s} - 1)/(e^k - 1). Centre gain k/(e^k-1): k=3 -> 0.157, k=2.5 -> 0.218.
+#define JOY_PAN_EXPO_K            3.0f
+#define JOY_PITCH_EXPO_K          2.5f
+#define JOY_PAN_MAX_RATE_DPS      90.0f
+#define JOY_PITCH_MAX_RATE_DPS    60.0f
+#define JOY_PAN_MAX_ACCEL_DPS2    180.0f   // 0 -> 90 deg/s in >= 0.5 s: no visible "lurch"
+#define JOY_PITCH_MAX_ACCEL_DPS2  120.0f
+#define JOY_PAN_INVERT            0
+#define JOY_PITCH_INVERT          0
+#define JOY_SMOOTH_TAU_S          0.08f    // per pole; 2 poles -> ~0.27 s 10-90% ease on a step
+#define JOY_PRECISION_SCALE       0.30f    // 'P' serial command toggles precision mode
+// Dynamic deadband (normalised stick units, 1.0 = full deflection)
+#define JOY_DB_BASE               0.025f
+#define JOY_DB_NOISE_K            5.0f
+#define JOY_DB_MIN                0.03f
+#define JOY_DB_MAX                0.20f
+#define JOY_RELEASE_RADIUS        0.22f
+#define JOY_RELEASE_TAU_S         0.12f
+// Travel limits around the power-on pose (rad, 0 = unlimited) with a soft decel zone.
+#define JOY_PAN_LIMIT_RAD         2.967f   // +/-170 deg: protects the yoke harness (no slip ring)
+#define JOY_PITCH_LIMIT_RAD       1.047f   // +/-60 deg: inside the cradle hard stops
+#define JOY_SOFT_ZONE_RAD         0.26f    // ~15 deg linear rate fade into each limit
+#ifndef JOY_TELEMETRY_PERIOD_MS
+#define JOY_TELEMETRY_PERIOD_MS   0        // >0: print joystick state from loop() at this period
 #endif
 
 #endif  // GIMBAL_CONFIG_H

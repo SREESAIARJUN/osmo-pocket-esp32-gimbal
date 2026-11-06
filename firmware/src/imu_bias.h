@@ -114,6 +114,16 @@ public:
         float r_floor     = 1.0e-9f;    // (rad/s)^2  measurement-noise floor (vibration, quantisation)
         float gate_sigma  = 5.0f;       // innovation gate
         float temp_tau_s  = 0.5f;       // die-temperature low-pass time constant
+        // Lock-out recovery: a converged filter's gate is ~0.02 dps wide, so a real
+        // bias shift (turn-on repeatability, shock, tempco hysteresis) would be
+        // rejected for tens of minutes (Rev 57 review). After REANCHOR_WINDOWS
+        // consecutive rejected windows that agree with each other (same sign,
+        // spread < gate), the offset covariance is inflated to the innovation and
+        // the window is fused: the filter re-anchors in ~3 s.
+        uint8_t reanchor_windows = 6;
+        // Turn-on-to-turn-on ZRO repeatability: floor on the offset sigma after
+        // importing a persisted model (the q_b0 * age random walk is far too small).
+        float import_b0_sigma = 0.00175f;  // rad/s (0.1 dps)
     };
 
     GyroTempBias() { reset(); }
@@ -138,6 +148,7 @@ public:
     int update(const StillnessDetector::Window& w);
 
     uint32_t updates() const { return updates_; }
+    uint32_t reanchors() const { return reanchors_; }
     uint32_t rejected() const { return rejected_; }
     float b0(int i) const { return b0_[i]; }
     float b1(int i) const { return b1_[i]; }
@@ -156,7 +167,9 @@ private:
     bool     t_init_ = false;
     bool     seen_ = false;
     float    t_min_ = 0.0f, t_max_ = 0.0f;
-    uint32_t updates_ = 0, rejected_ = 0;
+    uint32_t updates_ = 0, rejected_ = 0, reanchors_ = 0;
+    uint8_t  rej_run_[3] = {0, 0, 0};       // consecutive rejected windows per axis
+    float    rej_first_[3] = {0, 0, 0};     // innovation of the first window in the run
 };
 
 #endif  // IMU_BIAS_H

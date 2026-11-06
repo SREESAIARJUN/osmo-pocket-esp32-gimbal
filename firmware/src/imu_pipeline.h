@@ -25,6 +25,7 @@
 #define IMU_PIPELINE_H
 
 #include <stdint.h>
+#include <atomic>
 #include "icm42688.h"
 #include "madgwick_ahrs.h"
 #include "imu_bias.h"
@@ -112,6 +113,14 @@ public:
     /** Drain the FIFO, run the pipeline on every record, publish. Returns records processed. */
     size_t service(uint32_t now_us);
 
+    /**
+     * Inhibit bias learning (callable from any core). The stabiliser MUST set
+     * this while it commands camera motion: a slow motorised pan passes every
+     * stillness test (low variance, gravity not rotating) and would be learned
+     * as gyro bias. Bias compensation itself keeps running.
+     */
+    void setLearningInhibit(bool on) { learn_inhibit_.store(on, std::memory_order_relaxed); }
+
     /** Lock-free snapshot, callable from any core. */
     bool latest(AttitudeState& s) const { return box_.read(s); }
     bool latestModel(GyroTempModel& m) const { return model_box_.read(m); }
@@ -146,6 +155,7 @@ private:
     uint8_t  reinits_ = 0;
     bool     gap_since_publish_ = false;
     bool     last_status_ok_ = false;
+    std::atomic<bool> learn_inhibit_{false};
 
     float    rate_b_[3] = {0, 0, 0};
     float    accel_b_[3] = {0, 0, 1};

@@ -128,7 +128,7 @@ const char* flags_str(uint32_t flags, char* buf, size_t len);
 // 1. Zero-electrical-offset / direction / pole-pair estimator
 // ===========================================================================
 struct OffsetLimits {
-    float pp_tolerance      = 0.15f;   // |pp_meas - pp| / pp
+    float pp_tolerance      = 0.45f;   // |pp_meas - pp| (absolute): must round to the configured pp
     float stall_fraction    = 0.5f;    // |slope| < stall_fraction / pp -> stall
     float max_residual_rms  = 0.35f;   // rad electrical (20 deg)
     float max_load_angle    = 0.70f;   // rad electrical (40 deg) at the highest amplitude
@@ -177,7 +177,7 @@ private:
 // ===========================================================================
 struct ResistanceLimits {
     float min_r2        = 0.98f;
-    float min_x_span    = 0.05f;   // W: required spread of 1.5*V^2/R... in x units (V^2)
+    float min_x_std     = 0.5f;    // V^2: required std-dev of x = 1.5*V^2 (needs >= 2 distinct amplitudes)
 };
 
 struct ResistanceResult {
@@ -210,7 +210,8 @@ private:
 struct BemfLimits {
     float min_r2      = 0.95f;
     int   min_speeds  = 3;
-    int   min_samples = 20;    // per (speed, direction) bin
+    int   min_samples = 72;    // per (speed, direction) bin: >= 2 samples per position bin
+    float max_count_asym = 0.25f;  // |n+ - n-| / max(n+, n-): unequal window coverage -> drop speed
 };
 
 struct BemfResult {
@@ -229,14 +230,37 @@ class BemfEstimator {
 public:
     static constexpr int MAX_SPEEDS = 8;
     void reset();
-    // vq: ACTUAL q-axis voltage (V); omega: measured mechanical velocity (rad/s)
-    void add(int speed_idx, int dir, float vq, float omega);
+    // vq: ACTUAL q-axis voltage (V); omega: measured mechanical velocity (rad/s);
+    // weight: the sample's position increment |d theta| (rad) so the bin means
+    // are path averages over the window (see motor_cal.cpp cl_move()).
+    void add(int speed_idx, int dir, float vq, float omega, float weight = 1.0f);
     bool solve(const BemfLimits& lim, BemfResult& out) const;
     uint32_t count(int speed_idx, int dir) const;
 
+    // Position-binned sweep (used by the sequencer). Samples are binned by the
+    // MEASURED angle into SWEEP_BINS equal bins across [wlo, whi]; end_sweep()
+    // adds the equal-weight mean of the bin means, i.e. a path average over
+    // theta rather than a time average. Time-averaging is biased whenever the
+    // speed ripples with position (cogging at low speed): the rotor dwells
+    // longer where the load opposes motion. With 6 bins per cogging period
+    // the 12th-harmonic cogging and any smooth load cancel exactly.
+    // Returns false (sweep discarded) unless every bin received a sample.
+    static constexpr int SWEEP_BINS = 36;
+    void begin_sweep(int speed_idx, int dir, float wlo, float whi);
+    void sample(float theta, float vq, float omega);
+    bool end_sweep();
+
 private:
+    struct Sweep {
+        int   k = -1, dir = 0;
+        float lo = 0, hi = 0;
+        float vq[SWEEP_BINS], w[SWEEP_BINS];
+        uint16_t n[SWEEP_BINS];
+        uint32_t total = 0;
+    } sw_cur_;
     double   svq_[MAX_SPEEDS][2] = {};
     double   sw_[MAX_SPEEDS][2]  = {};
+    double   swt_[MAX_SPEEDS][2] = {};
     uint32_t n_[MAX_SPEEDS][2]   = {};
 };
 
@@ -258,7 +282,8 @@ public:
     // Block until the next control tick (period = SeqConfig::dt).
     virtual void  tick() = 0;
     // Closed loop (SimpleFOC angle mode) with the given offsets: initFOC().
-    virtual bool  closedLoopBegin(float zero_electric_angle, int direction) = 0;
+    // theta0 receives the shaft angle (direction-corrected SimpleFOC frame).
+    virtual bool  closedLoopBegin(float zero_electric_angle, int direction, float& theta0) = 0;
     // One closed-loop step towards target (rad): loopFOC()+move(). Returns the
     // COMMANDED Vq that move() produced, the filtered velocity and the angle.
     virtual bool  closedLoopStep(float target, float& vq_cmd, float& velocity, float& theta_m) = 0;
@@ -292,6 +317,7 @@ struct SeqConfig {
     int   stator_slots    = 12;
     float kv_accel        = 40.0f;    // rad/s^2 target acceleration
     float kv_lead_s       = 0.06f;    // constant-speed time before the window opens
+    float kv_margin_rad   = 0.03f;    // extra run-out for closed-loop tracking lag
     float kv_max_travel   = 1.6f;     // rad mech, total excursion budget per sweep
     float kv_reposition_speed = 1.0f; // rad/s mech, slow moves between sweeps
     // physics / acceptance

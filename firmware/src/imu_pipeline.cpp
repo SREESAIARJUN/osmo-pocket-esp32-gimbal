@@ -10,7 +10,10 @@ ImuStatus ImuChannel::begin(uint32_t now_us) {
     have_tmst_ = false;
     clk_armed_ = false;
     still_.reset();
-    last_record_us_ = now_us;
+    (void)now_us;
+    // Stamp AFTER dev_.begin(): it blocks ~52 ms, and a pre-delay stamp made the
+    // very next service() see "no data for 50 ms" and re-initialise again.
+    last_record_us_ = static_cast<uint32_t>(micros());
     last_status_ok_ = (st == ImuStatus::OK);
     publish(now_us);
     return st;
@@ -45,7 +48,8 @@ void ImuChannel::process(const ImuRecord& r, bool gap) {
     if (still_.push(r.gyro, r.accel, t_f, w)) {
         bias_.predict(predict_pending_s_);
         predict_pending_s_ = 0.0f;
-        if (bias_.update(w) > 0) publishModel();
+        // A commanded slow pan is indistinguishable from bias to the IMU alone.
+        if (!learn_inhibit_.load(std::memory_order_relaxed) && bias_.update(w) > 0) publishModel();
     } else if (predict_pending_s_ >= 1.0f) {
         bias_.predict(predict_pending_s_);
         predict_pending_s_ = 0.0f;
@@ -70,10 +74,11 @@ size_t ImuChannel::service(uint32_t now_us) {
 
     ImuRecord rec[ICM42688::MAX_BATCH];
     size_t total = 0;
+    uint16_t remaining = 0;
     // Bounded drain: at most 4 bursts (64 records = 64 ms of backlog) per call,
     // so one call never monopolises the task; the rest is read next tick.
     for (int pass = 0; pass < 4; ++pass) {
-        uint16_t remaining = 0;
+        remaining = 0;
         const size_t n = dev_.readFifo(rec, ICM42688::MAX_BATCH, &remaining);
         const bool gap = dev_.takeResync();
         if (gap) gap_since_publish_ = true;
@@ -85,7 +90,12 @@ size_t ImuChannel::service(uint32_t now_us) {
     if (total > 0) {
         last_record_us_ = now_us;
         // ---- device clock ratio (host us per device us) --------------------
-        if (!clk_armed_) {
+        // Only open/close the window when the FIFO is drained: then the newest
+        // record is < 1 ODR period old and now_us is a fair stamp for it. With a
+        // backlog the stamp is up to 64+ ms late (Rev 57 review: ~2 % error).
+        if (remaining != 0) {
+            // keep the window as is; it is closed on a later drained call
+        } else if (!clk_armed_) {
             clk_armed_ = true;
             clk_dev_ticks_ = 0;
             clk_host0_ = now_us;

@@ -18,7 +18,7 @@
 |---|---|
 | `cad/`, `stl/` | Parametric OpenSCAD sources and printable STL meshes |
 | `kicad/` | KiCad 8 schematic and 4-layer PCB, `kicad/tools/gen_rev7_schematic.py` (schematic generator), and `gerbers/` |
-| `firmware/` | PlatformIO project (`platformio.ini`), SimpleFOC firmware in `src/`, host-side unit tests in `test/host/` |
+| `firmware/` | PlatformIO project (`platformio.ini`), SimpleFOC firmware in `src/` (including the Rev 57 IMU stack: `icm42688`, `madgwick_ahrs`, `imu_bias`, `imu_pipeline`), host-side unit tests in `test/host/` |
 | `simulation/` | Roll-axis physics simulator, encoder-bus timing budget, and Wokwi project |
 
 ### Build & verify
@@ -28,6 +28,133 @@ cd firmware && pio run -e esp32-s3-devkitc-1     # cross-compile (pioarduino / A
 cd simulation && python3 gimbal_physics_sim.py && python3 encoder_bus_budget.py
 kicad-cli sch erc --severity-error kicad/osmo-pocket-esp32-gimbal.kicad_sch
 ```
+
+---
+
+## Revision 57.0 Engineering Changelog
+**Task:** firmware for the ICM-42688-P: a 1 kHz SPI FIFO reader, a Madgwick AHRS, and compensation for temperature-driven gyro bias drift.
+
+### Starting point
+The pin map reserved SPI2 for two ICM-42688-P (SCK 21 / MOSI 38 / MISO 47, CS 48 camera / 16 handle) and the System Overview advertised dual IMUs. However, **`firmware/src/` contained no IMU code at all**: no driver, no attitude estimate, and nothing for the stabiliser to close a horizon loop on.
+
+### Changes implemented
+**`icm42688.{h,cpp}` (new): register-level SPI FIFO driver**
+- **Bring-up.** Soft reset, then a WHO_AM_I check (`0x47`). Every configuration register is written and then **read back**, so a stuck MISO, a wrong CS or an ICM-42605 fitted by mistake is reported as `NOT_PRESENT` or `CONFIG_FAULT` instead of streaming garbage.
+- **Configuration.**
+  - Gyro and accel in Low-Noise mode at **ODR 1 kHz**, UI filter BW ODR/4 (250 Hz).
+  - I2C slave disabled (`INTF_CONFIG0 = 0x73`).
+  - Big-endian data, `FIFO_COUNT` reported in **records**.
+  - Absolute 1 µs timestamp (`TMST_CONFIG = 0x01`).
+  - FIFO in stream mode.
+- **Hi-res FIFO packet 4** (20 bytes/record, `FIFO_CONFIG1 = 0x1F`). Each record holds a 20-bit accel/gyro value (8-bit high/mid bytes plus a nibble in the extension byte), a **16-bit temperature** and a 16-bit timestamp.
+  - Full scale is fixed at ±2000 dps / ±16 g with 2¹⁹ LSB = FS, i.e. 262.144 LSB/dps and 32768 LSB/g. A hard handle flick cannot clip the gyro, and resolution is still 0.0038 dps.
+  - The FIFO temperature is 7.5 mK/LSB (raw/132.48 + 25 °C), instead of the 0.48 °C step of the 8-bit packet 3. That resolution is what makes a temperature bias model usable.
+- **Two SPI transactions per service.**
+  1. A 3-byte burst at `INT_STATUS..FIFO_COUNTL`. This clears `FIFO_FULL` and latches the count in one go.
+  2. One burst of N×20 bytes.
+
+  At 8 MHz that is about 22 µs of bus time per record, under 5 % of SPI2 for both IMUs at 1 kHz.
+- **Fault handling.**
+  - **Overflow:** sets the resync flag, so dt is not trusted across the gap.
+  - **Impossible count:** the FIFO is flushed.
+  - **Header mismatch:** the FIFO is flushed and resync is flagged. A record header with the "empty" bit set *inside* the latched count also counts as lost alignment (see review fix R2).
+  - **Invalid-sample markers** (`0x8000` in bits [19:4]): the record is dropped.
+- **`ArduinoSpiDevice`** (SPI mode 3) only uses `transferBytes()` on 4-byte-aligned buffers of at least 8 bytes. The HAL stores through `uint32_t*`, and an unaligned store traps on the LX7. Short register reads go byte-by-byte.
+
+**`madgwick_ahrs.{h,cpp}` (new): 6-DoF Madgwick gradient-descent filter**
+- Single-precision only. q maps body to earth (+Z up), and Euler angles are aerospace Z-Y-X.
+- **Initial alignment from the accelerometer.** `beta_init = 1.0` rad/s is used for 0.5 s, then the steady-state `beta = 0.02` rad/s. That allows about 1.3 dps of residual gyro error, and the correction slew is capped at 2β = 2.3 °/s.
+- **Accelerometer magnitude gating.** The weight is 1 below |‖a‖−1 g| = 0.05 g and ramps linearly to 0 at 0.20 g, so handle swings do not tilt the horizon.
+- Variable dt per sample. Bad dt values (≤ 0, NaN, > 100 ms) are rejected, and a NaN blow-up resets the filter and re-aligns it.
+- Optional Madgwick ζ gyro-bias integrator (eq. 47–48), clamped at 2 dps. It defaults to **off**, because bias is handled by `imu_bias` and is unobservable about the gravity axis anyway.
+
+**`imu_bias.{h,cpp}` (new): gyro zero-rate output vs. temperature**
+- **Model:** per sensor axis, `b(T) = b0 + b1·(T − 25 °C)`.
+- **Estimator:** a 2-state Kalman filter per axis, with `H = [1, T−25]` and `R = var/N + floor`.
+  - Priors: b0 ±1 dps, b1 ±0.01 dps/°C.
+  - Process noise on the offset is 1e-11 (rad/s)²/s, matched to the bias instability.
+  - A single temperature only anchors b0. Once the board has warmed through a span, the slope becomes observable and is learned.
+  - The die temperature is low-passed with τ = 0.5 s before the model is evaluated.
+- **`StillnessDetector`:** 500-sample (0.5 s) windows. A window counts as still only if all of these hold:
+  - gyro σ < 0.2 dps
+  - accel σ < 6 mg
+  - |‖a‖ − 1 g| < 0.05
+  - |mean rate| < 3 dps
+  - gravity rotated by less than 0.034° between the two halves of the window. This last test rejects slow constant rotation about any non-vertical axis.
+
+  Sums are taken about the first sample of the window, so float is exact enough and no soft-double is needed.
+- **Innovation gate at 5σ,** with re-anchoring. After 6 consecutive rejected windows that agree with each other, the offset covariance is inflated to the innovation and the window is fused (see review fix R1).
+- **Persistence:** a `GyroTempModel` snapshot with CRC-32, plus a PSD and finiteness check on import. On import the offset σ is floored at the 0.1 dps turn-on repeatability.
+
+**`imu_pipeline.{h,cpp}` (new): `ImuChannel`, one per IMU**
+- The per-record pipeline is:
+  1. **dt** from device-timestamp deltas × the measured **device-clock ratio**. The ratio is taken against `micros()` over 2 s windows, only when the FIFO is fully drained. The ICM's internal oscillator tolerance would otherwise become a gyro-integration scale error: 1.5 % equals 1.35° on a 90° pan.
+  2. Temperature low-pass, then gyro − b(T) in the **sensor** frame.
+  3. Stillness detector, feeding the bias model.
+  4. Signed-permutation remap to the body frame. `ImuMount::valid()` is `constexpr`: it rejects duplicate axes and mirrored (det = −1) maps at compile time.
+  5. Madgwick update.
+- `AttitudeState` is published through `SeqLock` and holds: q, roll/pitch/yaw, bias-corrected rates, accel, the current bias, temperature, accel weight, clock scale, timestamps, counters, status, and these flags: `ALIGNED`, `BIAS_LEARNED`, `SLOPE_LEARNED`, `STILL`, `ACCEL_GATED`, `GAP`, `CLOCK_LOCKED`.
+- **Self-healing.** If no record arrives for 50 ms, `begin()` runs again (brown-out or CS glitch). Each service drains at most 64 records, so one call never monopolises the task.
+- **`setLearningInhibit()`.** A slow motorised pan passes every stillness test and would otherwise be learned as bias, so the stabiliser must set this flag while it commands motion.
+- **`start_imu_task()`** creates the `imu_spi` FreeRTOS task:
+  - pinned to **core 0** at **priority 6**, above the encoder sweep (5), so the 1 ms tick preempts the I2C sweep
+  - `xTaskDelayUntil(1 tick)`, with `static_assert(configTICK_RATE_HZ == 1000)`
+  - a 6 KB stack
+  - the only owner of the shared SPI2 bus
+
+**`main.cpp` / `gimbal_config.h`**
+- `SPIClass(FSPI)` is used with both chip selects driven high before the bus clocks.
+- Two `ImuChannel`s are built from the new `IMU_*` / `AHRS_*` / `GYRO_BIAS_*` configuration block. The mount maps are checked with `static_assert`.
+- The learned bias(T) model is **restored from NVS** at boot. It is saved on the `B` serial command, **only while every motor is disabled**, because a flash write stalls both cores' caches mid-commutation.
+- Optional attitude telemetry via `-DIMU_TELEMETRY_PERIOD_MS=…`.
+
+**Pre-existing defects fixed along the way (anti-cogging, Rev 8.0 code)**
+- `test_anti_cogging.cpp` **had not been compiling.** `bad.add(LUT_SIZE/2, …)` overflowed the `uint8_t` parameter under `-Werror`, so the whole anti-cogging suite never ran.
+- `HarmonicSet::add(uint8_t order)` **silently truncated** orders above 255. For example 268 became 12, so a wrong harmonic was accepted. It now takes `int` and rejects anything outside 1 … LUT_SIZE/2−1.
+- `Lut::build()` accepted an **empty** set and zeroed the live cogging table. It now returns false and keeps the previous table.
+- Four feed-forward assertions had demanded 0.1 % accuracy at a point between LUT samples, below the 0.47 % interpolation bound that the same file proves. They had been hidden by the compile error. The tolerance is now set to that bound.
+
+### Architecture
+```
+ core 0  imu_spi task (prio 6, 1 kHz)              enc_i2c task (prio 5)          core 1  loop()
+ SPI2 8 MHz mode 3 ─┬ CS48 ICM-42688-P (camera) ─► ImuChannel ─► SeqLock<AttitudeState> ─┐
+                    └ CS16 ICM-42688-P (handle) ─► ImuChannel ─► SeqLock<AttitudeState> ─┼─► stabiliser / telemetry
+  per record: FIFO(20 B, tmst) → dt·clk → T lpf → ω−b(T) → stillness→Kalman b0,b1         │   FOC ×3 (unchanged)
+              → mount remap → Madgwick(gated) ─────────────────────────────────────────────┘
+ NVS "imu_bias": GyroTempModel (CRC-32) restored at boot, saved on 'B' with motors idle
+```
+
+### Adversarial review (multi-agent workflow) and fixes
+Four independent reviewers covered datasheet correctness, RTOS/concurrency, estimator maths and test validity. Each finding then went to a skeptic told to refute it. **3 findings were confirmed and 8 refuted.** All confirmed findings are fixed and each has a regression test:
+
+| # | Finding | Fix |
+|---|---|---|
+| R1 | **The bias Kalman could lock out.** Once converged, the 5σ gate is about 0.02 dps wide, and rejections never widened P. A 0.04 dps bias step went untracked for **1122 s**. After an NVS import (which added only q·age = 3.6e-8), a 0.08 dps turn-on shift was rejected for **about 50 min**, i.e. 4.8°/min of pan creep. | Re-anchor after 6 consistent rejections, so a 0.04 dps step is tracked in **3.0 s**. A single outlier is still gated out. The import covariance is floored at 0.1 dps. |
+| R2 | **A 1-byte FIFO slip could look like "FIFO empty".** The slip only went undetected when the stray header byte had bit 7 set, i.e. a negative accel-X high byte. Then 50 ms of silence was followed by a full re-init that stalled *both* IMUs. | A header with the empty bit inside the latched count is treated as an alignment error and the FIFO is flushed. Streaming resumes within 2 ms with no re-init. |
+| R3 | **The clock-ratio window opened or closed with a FIFO backlog pending**, so after a stall `clock_scale` could be up to about 2 % off. | The window only opens or closes when the FIFO is fully drained. Across 80 ms and 130 ms stalls it stays within 1e-3. |
+| + | Hardening from refuted-but-cheap items: `begin()` now timestamps *after* its 52 ms of start-up delays, and a test covers a rotated (non-identity) mount with the bias removed in the sensor frame. | |
+
+### Validation status
+| Check | Result |
+|---|---|
+| Cross-compile, `pio run -e esp32-s3-devkitc-1` (Arduino-ESP32 3.1.3) | ✅ SUCCESS: RAM 9.7 % (31,920 B), flash 12.9 % (431,264 B). Project sources produce no warnings. |
+| Soft-float audit of the Xtensa objects (`objdump -dr`, 2,376 instructions in the 4 new modules) | ✅ **0** calls to `__adddf3/__muldf3/__divdf3/__subdf3/__extendsfdf2` |
+| Host build of the new modules with `-Wall -Wextra -Werror -Wconversion -Wdouble-promotion -Wshadow` plus ASan/UBSan | ✅ clean |
+| `test_imu.cpp`: 22 tests / **133 checks**. These run against a register-level ICM-42688-P model (soft reset, clear-on-read INT_STATUS, record-count FIFO, stream overflow, flush, 20-bit packet-4 encoding, device-clock error, true bias(T), noise). | ✅ all pass |
+| ↳ Warm-up yaw drift: 150 s still at 25→32 °C, then 300 s handheld (tremor, never still) at 32→45 °C, with true bias 0.25 dps + 0.006 dps/°C on Z | ✅ **−0.29°** with the temperature model, vs **12.45°** with constant-offset calibration and about 99° raw |
+| ↳ Device clock 1.5 % fast, 90° pan | ✅ clock_scale = 1/1.015 ± 5e-4, pan 90° ± 0.25° (the uncorrected result would be 91.35°) |
+| ↳ Service jitter 1–7 ms (starved task) | ✅ 90° ± 0.1°, 0 overflows. The timestamps keep dt exact. |
+| ↳ Static alignment / AHRS hold / 90°/s tracking / gating at 0.8 g | ✅ ±0.05° / ±0.05° over 20 s / ±0.2° / 0° tilt (ungated: > 1°) |
+| `test_anti_cogging.cpp` (compiles again) | ✅ 5,931 checks pass |
+| `test_encoder_mux.cpp` | ✅ 111 checks pass |
+| Negative pin-map compile tests | ⚠️ "strapping GPIO46" now reports *accepted*. This is **not caused by Rev 57**. A concurrent revision (the Rev 59 joystick work, uncommitted in the shared tree) moved `ENC_MUX_RST_N` from GPIO2 to GPIO40, so the runner's `sed 's/ENC_MUX_RST_N = 2;/…/'` no longer matches anything and nothing is mutated. That revision's owner needs to update the sed target. |
+
+### Known limitations / open items
+1. **Not yet validated on hardware.** On hardware, check: WHO_AM_I and the readback on both CS lines; the FIFO record rate (expect 1000 ± 1 %/s); `clock_scale`; and the IMU task's CPU time and its jitter on the encoder sweep.
+2. **Yaw is unobservable** without a magnetometer. Yaw drift is bounded only by how good the bias model is. Learning must be inhibited during commanded pans; the stabiliser does not call `setLearningInhibit()` yet, because there is no attitude-to-motor-target loop yet.
+3. A **magnitude-only accel gate** cannot reject a small lateral acceleration (0.3 g gives ‖a‖ = 1.044 g). That error is bounded only by the 2β slew of 2.3°/s. A centripetal/linear-acceleration feed-forward from the handle IMU is the next step.
+4. The bias model is linear in T. If hardware shows curvature or hysteresis beyond the re-anchor behaviour, add a quadratic term (a 3-state filter).
+5. The **IMU mount maps** are identity placeholders until the PCB placement of U-IMU1/U-IMU2 is final.
 
 ---
 

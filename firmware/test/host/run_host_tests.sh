@@ -50,7 +50,14 @@ neg() {  # $1 description, $2 sed expression applied to a copy of gimbal_pins.h
 }
 neg "Rev 6.0 SCL on non-existent GPIO22" 's/ENC_I2C_SCL   = 18;/ENC_I2C_SCL   = 22;/'
 neg "octal-PSRAM GPIO35"                 's/IMU_CS_HANDLE  = 16;/IMU_CS_HANDLE  = 35;/'
-neg "strapping GPIO46"                   's/ENC_MUX_RST_N = 2;/ENC_MUX_RST_N = 46;/'
+neg "strapping GPIO46"                   's/ENC_MUX_RST_N = 40;/ENC_MUX_RST_N = 46;/'
 neg "duplicate GPIO17"                   's/ENC_I2C_SCL   = 18;/ENC_I2C_SCL   = 17;/'
 neg "VBAT_SENSE moved off ADC1 (swap with GPIO21)" 's/VBAT_SENSE = 1;/VBAT_SENSE = 21;/;s/IMU_SPI_SCK    = 21;/IMU_SPI_SCK    = 1;/'
+
+echo "== build & run motor calibration tests"
+g++ -std=c++17 -O1 -I firmware/src -I firmware/test/host/mock firmware/test/host/test_motor_cal.cpp firmware/src/motor_cal.cpp -o /tmp/test_motor_cal && /tmp/test_motor_cal
+
+echo "== build & run joystick tests"
+g++ -std=c++17 -O1 -I firmware/src -I firmware/test/host/mock firmware/test/host/test_joystick.cpp firmware/src/joystick_shaper.cpp -o /tmp/test_joystick && /tmp/test_joystick
+
 echo "ALL HOST TESTS PASSED"

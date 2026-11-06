@@ -124,7 +124,10 @@ size_t ICM42688::readFifo(ImuRecord* out, size_t max, uint16_t* remaining) {
     size_t got = 0;
     for (size_t k = 0; k < n; ++k) {
         const uint8_t* p = buf_ + k * RECORD_BYTES;
-        if (p[0] & HDR_MSG_EMPTY) break;           // drained faster than the count said
+        // Every record inside the latched FIFO_COUNT is real data, so a header
+        // with the "empty" bit (or any other mismatch) means byte alignment was
+        // lost (CS glitch, partial burst): a data byte >= 0x80 would otherwise be
+        // mistaken for "empty" on every later burst (Rev 57 review).
         if ((p[0] & HDR_MASK) != HDR_PACKET4) {    // alignment lost: everything after is garbage
             ++header_errors_;
             flush();

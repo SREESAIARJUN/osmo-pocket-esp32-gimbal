@@ -475,10 +475,11 @@ TEST(bias_model_persistence_roundtrip_and_crc) {
     b.bias(40.0f, o1);
     c.bias(40.0f, o2);
     for (int i = 0; i < 3; ++i) CHECK(o1[i] == o2[i]);
-    // Age inflates offset uncertainty
+    // Import floors the offset sigma at turn-on repeatability (0.1 dps); age only adds to it.
     GyroTempBias d;
     CHECK(d.importModel(m, 3600.0f));
-    CHECK(d.b0Sigma(0) > c.b0Sigma(0));
+    CHECK(c.b0Sigma(0) >= 0.1f * (float)D2R * 0.999f);
+    CHECK(d.b0Sigma(0) >= c.b0Sigma(0));
     GyroTempModel bad = m;
     reinterpret_cast<uint8_t*>(&bad)[10] ^= 0x01;
     CHECK(!bad.valid());
@@ -624,6 +625,136 @@ TEST(pipeline_temperature_model_cancels_warmup_yaw_drift) {
                 drift_model, drift_const, 0.25 * 300 + 0.006 * 300 * 13.5);
     CHECK(std::fabs(drift_model) < 1.0);
     CHECK(std::fabs(drift_const) > 8.0);
+}
+
+// ===========================================================================
+// Rev 57 review regressions
+// ===========================================================================
+static StillnessDetector::Window still_window(double bias_rad_s, double T, std::mt19937& rng) {
+    std::normal_distribution<double> n(0, 1);
+    StillnessDetector::Window w;
+    const double sd = 0.044 * D2R / std::sqrt(500.0);
+    for (int i = 0; i < 3; ++i) {
+        w.gyro_mean[i] = (float)(bias_rad_s + sd * n(rng));
+        w.gyro_var[i] = (float)std::pow(0.044 * D2R, 2);
+    }
+    w.temp_mean = (float)T;
+    w.n = 500;
+    return w;
+}
+
+TEST(review_bias_step_after_convergence_reanchors_within_seconds) {
+    // Was: a 0.04 dps step after 300 s of convergence went untracked for 1122 s.
+    GyroTempBias b;
+    std::mt19937 rng(21);
+    for (int k = 0; k < 600; ++k) { b.predict(0.5f); b.update(still_window(0.25 * D2R, 30.0, rng)); }
+    const double stepped = 0.29 * D2R;
+    int windows = 0;
+    float out[3];
+    for (; windows < 200; ++windows) {
+        b.predict(0.5f);
+        b.update(still_window(stepped, 30.0, rng));
+        b.bias(30.0f, out);
+        if (std::fabs(out[2] - stepped) < 0.005 * D2R) break;
+    }
+    std::printf("  0.04 dps bias step re-anchored after %d windows (%.1f s), reanchors=%u\n",
+                windows + 1, 0.5 * (windows + 1), (unsigned)b.reanchors());
+    CHECK(windows < 12);            // ~3 s of re-anchor run + convergence
+    CHECK(b.reanchors() >= 1);
+    // A single outlier is still rejected without re-anchoring.
+    const uint32_t ra = b.reanchors();
+    StillnessDetector::Window o = still_window(stepped, 30.0, rng);
+    o.gyro_mean[2] += (float)(0.3 * D2R);
+    b.update(o);
+    for (int k = 0; k < 4; ++k) b.update(still_window(stepped, 30.0, rng));
+    CHECK(b.reanchors() == ra);
+}
+
+TEST(review_import_then_turn_on_shift_is_tracked_immediately) {
+    // Was: importModel(m, 3600 s) + 0.08 dps turn-on shift -> ~50 min lock-out.
+    GyroTempBias a;
+    std::mt19937 rng(5);
+    for (int k = 0; k < 600; ++k) { a.predict(0.5f); a.update(still_window(0.25 * D2R, 30.0, rng)); }
+    GyroTempModel m;
+    a.exportModel(m);
+    GyroTempBias b;
+    CHECK(b.importModel(m, 3600.0f));
+    CHECK(b.b0Sigma(0) >= 0.1f * (float)D2R * 0.999f);
+    for (int k = 0; k < 6; ++k) { b.predict(0.5f); b.update(still_window(0.33 * D2R, 30.0, rng)); }
+    float out[3];
+    b.bias(30.0f, out);
+    CHECK_NEAR(out[2] * R2D, 0.33, 0.005);
+    CHECK(b.rejected() == 0);
+}
+
+TEST(review_fifo_byte_slip_with_negative_accel_resyncs_without_reinit) {
+    // Was: header byte >= 0x80 after a 1-byte slip was taken as "FIFO empty" on
+    // every burst -> 50 ms of silence + full re-init stalling both IMUs.
+    mock::now_us = 1000;
+    FakeIcm f;
+    f.truth = [](double) { Truth t; t.accel[0] = -0.1; t.accel[2] = 0.995; return t; };
+    ICM42688 imu(f);
+    ImuChannel ch(imu, ImuMount{{1, 2, 3}}, default_cfg());
+    ch.begin(mock::now_us);
+    run(ch, 0.2);
+    mock::now_us += 3000;
+    f.advance();
+    f.fifo.pop_front();                       // lose one byte: stream now starts at accel-X high (0xFC..)
+    run(ch, 0.01);
+    AttitudeState s; ch.latest(s);
+    CHECK(imu.headerErrors() == 1);
+    CHECK(s.reinits == 0);
+    CHECK(mock::now_us - s.t_us <= 2000);     // streaming again within a couple of ms
+}
+
+TEST(review_clock_ratio_unbiased_by_fifo_backlog_after_stalls) {
+    // Was: window opened/closed with a 64+ ms backlog -> clock_scale off by ~2 %.
+    mock::now_us = 1000;
+    FakeIcm f;
+    ICM42688 imu(f);
+    ImuChannel ch(imu, ImuMount{{1, 2, 3}}, default_cfg());
+    ch.begin(mock::now_us);
+    for (int cycle = 0; cycle < 12; ++cycle) {
+        run(ch, 2.5);   // windows (2 s) must be able to close across the backlogged stalls
+        mock::now_us += (cycle % 2) ? 80000 : 130000;   // stalls: 80 ms backlog, 130 ms overflow
+        for (int k = 0; k < 8; ++k) { mock::now_us += 1000; ch.service(mock::now_us); }
+    }
+    AttitudeState s; ch.latest(s);
+    CHECK(s.flags & IMU_FLAG_CLOCK_LOCKED);
+    CHECK_NEAR(ch.clockScale(), 1.0, 1e-3);
+}
+
+TEST(review_rotated_mount_and_learning_inhibit) {
+    // Sensor rotated 90 deg about Z on the PCB: body X = sensor Y, body Y = -sensor X.
+    // A body-frame roll must appear as roll even though the sensor sees it on Y.
+    mock::now_us = 1000;
+    FakeIcm f;
+    const double r = 60.0 * D2R;
+    f.truth = [&](double t) {
+        Truth tr;   // in SENSOR axes: sensor Y = body X, sensor X = -body Y
+        const double roll = (t > 1.0) ? std::min(1.0, t - 1.0) * r : 0.0;
+        if (t > 1.0 && t <= 2.0) tr.gyro[1] = r;
+        double gb[3]; gravity_in_body(roll, 0, gb);
+        tr.accel[0] = -gb[1]; tr.accel[1] = gb[0]; tr.accel[2] = gb[2];
+        return tr;
+    };
+    f.b0_dps[0] = 0.2;   // sensor-X bias: must be removed in SENSOR frame (lands on body Y)
+    ICM42688 imu(f);
+    ImuChannel ch(imu, ImuMount{{2, -1, 3}}, default_cfg());
+    ch.begin(mock::now_us);
+    run(ch, 3.0);
+    CHECK_NEAR(ch.ahrs().roll() * R2D, 60.0, 0.3);
+    CHECK_NEAR(ch.ahrs().pitch() * R2D, 0.0, 0.3);
+    CHECK_NEAR(ch.bias().b0(0) * R2D, 0.2, 0.01);
+    CHECK(std::fabs(ch.bias().b0(1)) < 0.01 * D2R);
+    // Learning inhibit: a commanded slow motorised yaw pan (0.5 dps, gravity not
+    // rotating -> passes the stillness test) must not be learned as bias.
+    const uint32_t upd = ch.bias().updates();
+    ch.setLearningInhibit(true);
+    f.truth = [](double) { Truth tr; tr.gyro[2] = 0.5 * D2R; return tr; };
+    run(ch, 5.0);
+    CHECK(ch.bias().updates() == upd);
+    CHECK(std::fabs(ch.bias().b0(2)) < 0.01 * D2R);
 }
 
 int main() {

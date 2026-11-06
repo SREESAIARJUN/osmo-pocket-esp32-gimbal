@@ -109,7 +109,8 @@ void GyroTempBias::reset() {
     }
     t_init_ = false;
     seen_ = false;
-    updates_ = rejected_ = 0;
+    updates_ = rejected_ = reanchors_ = 0;
+    for (int i = 0; i < 3; ++i) { rej_run_[i] = 0; rej_first_[i] = 0.0f; }
 }
 
 float GyroTempBias::filterTemp(float temp_c, float dt) {
@@ -150,14 +151,26 @@ int GyroTempBias::update(const StillnessDetector::Window& w) {
     for (int i = 0; i < 3; ++i) {
         const float r = w.gyro_var[i] / static_cast<float>(w.n) + cfg_.r_floor;
         // H = [1 d];  PH^T = [p00 + d p01, p01 + d p11];  S = H P H^T + R
-        const float ph0 = p00_[i] + d * p01_[i];
-        const float ph1 = p01_[i] + d * p11_[i];
-        const float s   = ph0 + d * ph1 + r;
-        const float y   = w.gyro_mean[i] - (b0_[i] + b1_[i] * d);
-        if (!(s > 0.0f) || y * y > cfg_.gate_sigma * cfg_.gate_sigma * s) {
+        float ph0 = p00_[i] + d * p01_[i];
+        float ph1 = p01_[i] + d * p11_[i];
+        float s   = ph0 + d * ph1 + r;
+        const float y = w.gyro_mean[i] - (b0_[i] + b1_[i] * d);
+        if (!isfinite(y) || !(s > 0.0f)) { ++rejected_; continue; }
+        if (y * y > cfg_.gate_sigma * cfg_.gate_sigma * s) {
             ++rejected_;
-            continue;
+            // Consistent run of rejections = the bias really moved, not an outlier.
+            const float spread = cfg_.gate_sigma * sqrtf(r);
+            const bool consistent = rej_run_[i] > 0 && (y > 0.0f) == (rej_first_[i] > 0.0f) &&
+                                    fabsf(y - rej_first_[i]) < spread;
+            if (!consistent) { rej_run_[i] = 1; rej_first_[i] = y; continue; }
+            if (++rej_run_[i] < cfg_.reanchor_windows) continue;
+            // Re-anchor: make the offset as uncertain as the observed jump.
+            p00_[i] += y * y;
+            ph0 = p00_[i] + d * p01_[i];
+            s   = ph0 + d * ph1 + r;
+            ++reanchors_;
         }
+        rej_run_[i] = 0;
         const float k0 = ph0 / s, k1 = ph1 / s;
         b0_[i] += k0 * y;
         b1_[i] += k1 * y;
@@ -203,8 +216,14 @@ bool GyroTempBias::importModel(const GyroTempModel& m, float age_s) {
     t_max_ = m.t_max;
     seen_ = m.updates > 0;
     updates_ = m.updates;
-    // Bias also drifts with age (and on re-soldering / shock): inflate the
-    // offset covariance so the first still window can re-anchor it.
+    // Bias also drifts with age, and turn-on repeatability is far larger than
+    // the in-run random walk: floor the offset sigma so the first still window
+    // after boot re-anchors it instead of being gated out (Rev 57 review).
     predict(age_s);
+    const float f = cfg_.import_b0_sigma * cfg_.import_b0_sigma;
+    for (int i = 0; i < 3; ++i) {
+        if (p00_[i] < f) p00_[i] = f;
+        rej_run_[i] = 0;
+    }
     return true;
 }
